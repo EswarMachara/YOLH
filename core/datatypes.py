@@ -91,13 +91,13 @@ class QueryEmbedding:
 
     Attributes:
         embedding: Query embedding vector.
-            Shape: (B, D_query) where D_query=512
+            Shape: (B, D_query) where D_query=256
             dtype: torch.float32
             Constraint: L2-normalized (||emb||=1) for valid queries, zero for invalid
 
     Shape Variables:
         B: Batch size (>= 1)
-        D_query: Query embedding dimension (fixed at 512)
+        D_query: Query embedding dimension (fixed at 256)
     """
 
     embedding: "torch.Tensor"
@@ -144,7 +144,7 @@ D_VISION: int = 256
 D_SPATIAL: int = 128
 D_POSE: int = 128
 D_TOKEN: int = 256
-D_QUERY: int = 512
+D_QUERY: int = 256
 D_FUSED: int = 768
 H_MASK: int = 160
 W_MASK: int = 160
