@@ -66,9 +66,9 @@ class HumanToken:
 
     Attributes:
         tokens: Human token embeddings combining visual, spatial, and pose information.
-            Shape: (B, N, D_token) where D_token=512
+            Shape: (B, N, D_token) where D_token=256
             dtype: torch.float32
-            Composition: Projection of [visual_emb(256) | spatial_enc(128) | pose_enc(128)]
+            Composition: Projection of [visual_emb(256) | struct_emb(160)]
 
         valid: Validity mask indicating real tokens vs padding.
             Shape: (B, N)
@@ -77,7 +77,7 @@ class HumanToken:
     Shape Variables:
         B: Batch size (>= 1)
         N: Number of detected humans per image (>= 0)
-        D_token: Token dimension (fixed at 512)
+        D_token: Token dimension (fixed at 256)
     """
 
     tokens: "torch.Tensor"
@@ -143,7 +143,7 @@ class GroundingScores:
 D_VISION: int = 256
 D_SPATIAL: int = 128
 D_POSE: int = 128
-D_TOKEN: int = 512
+D_TOKEN: int = 256
 D_QUERY: int = 512
 D_FUSED: int = 768
 H_MASK: int = 160
