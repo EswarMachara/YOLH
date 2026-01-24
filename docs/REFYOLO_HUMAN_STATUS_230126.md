@@ -1,31 +1,3 @@
-CRITICAL RESOLUTION (MANDATORY BEFORE PHASE 2)
-
-Fact confirmed:
-Ultralytics does not provide a single model that outputs boxes + masks + keypoints.
-
-Implication:
-RefYOLO-Human must treat segmentation and pose as two vision sources until a unified backbone is implemented later (optional).
-
-Required architectural decision (LOCK THIS):
-
-Decision A (Recommended, minimal risk):
-
-Use pose model as primary detector
-
-Align segmentation masks to pose detections via IoU matching
-
-One VisionOutput per image, assembled from two model outputs
-
-Decision B (Deferred, higher risk):
-
-Custom YOLO head unification (NOT now)
-
-You already implicitly followed Decision A. This is correct.
-We proceed assuming Decision A is locked.
-
-No further changes needed in Phase 1
-
-
 # RefYOLO-Human: System Status Report
 
 **Date:** 2026-01-23  
