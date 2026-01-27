@@ -20,9 +20,13 @@ Constraints:
 - ❌ No training, no unfreezing YOLO
 - ✅ YOLO in eval mode, torch.no_grad()
 - ✅ Output matches HumanToken/VisionOutput contract inputs
+
+Usage:
+    python vision/cache_yolo_features.py --config config/config.yaml
 """
 
 import sys
+import argparse
 from pathlib import Path
 
 # Add project root to path
@@ -36,28 +40,17 @@ from tqdm import tqdm
 import time
 
 from core.datatypes import D_VISION, H_MASK, W_MASK, K_KEYPOINTS
+from core.config import load_config, add_config_argument, Config
 
 # =============================================================================
-# CONFIGURATION (LOCKED)
+# FEATURE EXTRACTION SETTINGS (NOT IN CONFIG - ARCHITECTURAL)
 # =============================================================================
 
-CONFIG = {
-    # Models
-    "pose_model": "yolo11n-pose.pt",
-    "seg_model": "yolo11n-seg.pt",
-    
-    # Feature extraction
+FEATURE_EXTRACTION_SETTINGS = {
     "feature_layer_idx": 9,  # C5 backbone output (SPPF)
     "roi_output_size": 7,
     "sampling_ratio": 2,
     "output_dim": D_VISION,  # 256
-    
-    # Cache
-    "cache_dir": "cache",
-    "images_dir": "images_200",
-    
-    # Processing
-    "device": "cpu",
 }
 
 
@@ -275,17 +268,21 @@ def match_masks_to_poses(
 # MAIN CACHING FUNCTION
 # =============================================================================
 
-def cache_yolo_features():
+def cache_yolo_features(config: Config):
     """
     Main function to cache YOLO features for all images.
+    
+    Args:
+        config: Configuration object with paths and settings.
     """
     print("\n" + "=" * 70)
     print("YOLO FEATURE CACHING FOR RefYOLO-Human TRAINING")
     print("=" * 70)
     
-    project_root = Path(__file__).parent.parent
-    images_dir = project_root / CONFIG["images_dir"]
-    cache_dir = project_root / CONFIG["cache_dir"]
+    # Get paths from config
+    images_dir = config.images_dir
+    cache_dir = config.features_dir
+    device = config.training.device
     
     # Create cache directory
     cache_dir.mkdir(exist_ok=True)
@@ -306,12 +303,12 @@ def cache_yolo_features():
     print("STEP 1: Initializing frozen YOLO models")
     print("-" * 50)
     
-    model_pose_path = project_root / CONFIG["pose_model"]
-    model_seg_path = project_root / CONFIG["seg_model"]
+    model_pose_path = config.pose_model_path
+    model_seg_path = config.seg_model_path
     
     print(f"  Loading pose model: {model_pose_path}")
     model_pose = YOLO(str(model_pose_path))
-    model_pose.to(CONFIG["device"])
+    model_pose.to(device)
     model_pose.model.eval()
     
     # Freeze all parameters
@@ -320,7 +317,7 @@ def cache_yolo_features():
     
     print(f"  Loading seg model: {model_seg_path}")
     model_seg = YOLO(str(model_seg_path))
-    model_seg.to(CONFIG["device"])
+    model_seg.to(device)
     model_seg.model.eval()
     
     for param in model_seg.model.parameters():
@@ -332,10 +329,10 @@ def cache_yolo_features():
     print("  Initializing feature extractor (Backbone + ROI Align)")
     extractor = CachingFeatureExtractor(
         model_pose,
-        feature_layer_idx=CONFIG["feature_layer_idx"],
-        output_dim=CONFIG["output_dim"],
+        feature_layer_idx=FEATURE_EXTRACTION_SETTINGS["feature_layer_idx"],
+        output_dim=FEATURE_EXTRACTION_SETTINGS["output_dim"],
     )
-    print(f"  ✓ Feature extractor ready (layer {CONFIG['feature_layer_idx']}, dim {CONFIG['output_dim']})")
+    print(f"  ✓ Feature extractor ready (layer {FEATURE_EXTRACTION_SETTINGS['feature_layer_idx']}, dim {FEATURE_EXTRACTION_SETTINGS['output_dim']})")
     
     # ==========================================================================
     # STEP 2-5: Process images and cache features
@@ -363,14 +360,14 @@ def cache_yolo_features():
             
             # Run YOLO inference (pose)
             with torch.no_grad():
-                results_pose = model_pose(str(img_path), device=CONFIG["device"], verbose=False)
+                results_pose = model_pose(str(img_path), device=device, verbose=False)
             result_pose = results_pose[0]
             orig_shape = result_pose.orig_shape  # (H, W)
             H_orig, W_orig = orig_shape
             
             # Run YOLO inference (seg)
             with torch.no_grad():
-                results_seg = model_seg(str(img_path), device=CONFIG["device"], verbose=False, classes=[0])
+                results_seg = model_seg(str(img_path), device=device, verbose=False, classes=[0])
             result_seg = results_seg[0]
             
             # Get pose detections
@@ -591,4 +588,12 @@ def cache_yolo_features():
 
 
 if __name__ == "__main__":
-    cache_yolo_features()
+    import argparse
+    from core.config import load_config, add_config_argument
+    
+    parser = argparse.ArgumentParser(description="Cache YOLO features for grounding training")
+    add_config_argument(parser)
+    args = parser.parse_args()
+    
+    config = load_config(args.config)
+    cache_yolo_features(config)
