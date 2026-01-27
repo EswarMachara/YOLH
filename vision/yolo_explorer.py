@@ -5,6 +5,10 @@ This script validates YOLO outputs and maps them into VisionOutput contract.
 Ultralytics does NOT have a single model for seg+pose+boxes simultaneously.
 We use yolo11n-pose for keypoints+boxes (person class only).
 Segmentation masks will be handled separately or as placeholders.
+
+⚠️ EXPLORATION SCRIPT - NOT FOR PRODUCTION USE
+   - Hardcoded CPU device for local development
+   - Use cache_yolo_features.py for device-aware production caching
 """
 
 import sys

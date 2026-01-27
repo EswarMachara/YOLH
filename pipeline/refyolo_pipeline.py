@@ -4,6 +4,10 @@ Phase 8: RefYOLO-Human Complete Inference Pipeline
 Assembles all components into a single end-to-end pipeline:
     Image + Query → Selected Humans
 
+⚠️ INFERENCE EXPLORATION SCRIPT - NOT FOR PRODUCTION TRAINING
+   - Hardcoded CPU device for local development/inference
+   - For GPU training, use training/grounding_train_cached.py with config device
+
 CPU-only. No training. No optimization. No batching.
 Pure orchestration - no logic duplication.
 """

@@ -63,16 +63,27 @@ class CachingFeatureExtractor:
     Extracts per-human visual embeddings from YOLO backbone features.
     
     Uses Backbone + ROI Align strategy (locked choice from Phase 2).
+    
+    DEVICE CONTRACT:
+    - All operations occur on self.device
+    - Model must already be on self.device before initialization
+    - Outputs are returned on self.device (moved to CPU before caching)
     """
     
-    def __init__(self, model: YOLO, feature_layer_idx: int = 9, output_dim: int = 256):
+    def __init__(self, model: YOLO, device: str, feature_layer_idx: int = 9, output_dim: int = 256):
         self.model = model
+        self.device = device
         self.feature_layer_idx = feature_layer_idx
         self.output_dim = output_dim
         self.features = None
         self._hook_handle = None
         self._feature_channels = None
         self._projection = None
+        
+        # Verify model is on expected device
+        model_device = next(model.model.parameters()).device
+        assert str(model_device).startswith(device.split(':')[0]), \
+            f"Model device mismatch: model on {model_device}, expected {device}"
         
         # Register hook on backbone layer
         self._register_hook()
@@ -92,7 +103,13 @@ class CachingFeatureExtractor:
     def _ensure_projection_initialized(self):
         """Initialize projection layer with fixed seed for reproducibility."""
         # Run dummy forward to get feature channel count
-        dummy_input = torch.randn(1, 3, 640, 640)
+        # CRITICAL: dummy must be on same device as model
+        dummy_input = torch.randn(1, 3, 640, 640, device=self.device)
+        
+        # Verify device consistency before dummy forward
+        assert dummy_input.device == next(self.model.model.parameters()).device, \
+            f"Device mismatch: dummy on {dummy_input.device}, model on {next(self.model.model.parameters()).device}"
+        
         with torch.no_grad():
             self.model.model(dummy_input)
         
@@ -106,22 +123,25 @@ class CachingFeatureExtractor:
             torch.nn.init.orthogonal_(self._projection.weight)
             self._projection.eval()
             self._projection.requires_grad_(False)
+            
+            # CRITICAL: Move projection to same device as model
+            self._projection.to(self.device)
     
     def extract(self, boxes_xyxy: torch.Tensor, orig_shape: tuple) -> torch.Tensor:
         """
         Extract per-human visual embeddings using ROI Align.
         
         Args:
-            boxes_xyxy: Detected boxes in [N, 4] xyxy pixel coordinates
+            boxes_xyxy: Detected boxes in [N, 4] xyxy pixel coordinates (will be moved to device)
             orig_shape: Original image shape (H, W)
             
         Returns:
-            visual_embeddings: Tensor[N, output_dim] - L2 normalized
+            visual_embeddings: Tensor[N, output_dim] - L2 normalized, on self.device
         """
         N = boxes_xyxy.shape[0]
         
         if N == 0:
-            return torch.zeros((0, self.output_dim), dtype=torch.float32)
+            return torch.zeros((0, self.output_dim), dtype=torch.float32, device=self.device)
         
         if self.features is None:
             raise RuntimeError("Features not captured. Run model inference first.")
@@ -130,17 +150,25 @@ class CachingFeatureExtractor:
         _, C, H_feat, W_feat = feat.shape
         orig_H, orig_W = orig_shape
         
+        # DEVICE ASSERTION: feature map must be on expected device
+        assert feat.device == torch.device(self.device) or str(feat.device).startswith(self.device.split(':')[0]), \
+            f"Feature map device mismatch: {feat.device} vs {self.device}"
+        
         # Scale boxes to feature map coordinates
+        # Move boxes to device first
+        boxes_scaled = boxes_xyxy.clone().float().to(self.device)
         scale_x = W_feat / orig_W
         scale_y = H_feat / orig_H
-        
-        boxes_scaled = boxes_xyxy.clone().float()
         boxes_scaled[:, [0, 2]] *= scale_x
         boxes_scaled[:, [1, 3]] *= scale_y
         
-        # Prepare ROIs: [N, 5] with batch index
-        batch_indices = torch.zeros((N, 1), dtype=torch.float32)
+        # Prepare ROIs: [N, 5] with batch index - MUST be on same device as features
+        batch_indices = torch.zeros((N, 1), dtype=torch.float32, device=self.device)
         rois = torch.cat([batch_indices, boxes_scaled], dim=1)
+        
+        # DEVICE ASSERTION before ROI Align
+        assert feat.device == rois.device, \
+            f"ROI Align device mismatch: features on {feat.device}, rois on {rois.device}"
         
         # ROI Align
         roi_features = roi_align(
@@ -155,6 +183,10 @@ class CachingFeatureExtractor:
         # Global average pooling
         pooled = F.adaptive_avg_pool2d(roi_features, (1, 1))  # [N, C, 1, 1]
         pooled = pooled.view(N, C)  # [N, C]
+        
+        # DEVICE ASSERTION before projection
+        assert pooled.device == next(self._projection.parameters()).device, \
+            f"Projection device mismatch: pooled on {pooled.device}, projection on {next(self._projection.parameters()).device}"
         
         # Project to output dimension
         with torch.no_grad():
@@ -284,6 +316,19 @@ def cache_yolo_features(config: Config):
     cache_dir = config.features_dir
     device = config.training.device
     
+    # ==========================================================================
+    # DEVICE VALIDATION (Global Contract - STEP 1 of audit)
+    # ==========================================================================
+    print(f"\nDevice configuration: {device}")
+    
+    # Assert CUDA availability if configured
+    if device.startswith("cuda"):
+        assert torch.cuda.is_available(), \
+            f"Config specifies device='{device}' but CUDA is not available!"
+        print(f"  ✓ CUDA available: {torch.cuda.get_device_name(0)}")
+    else:
+        print(f"  Running on CPU")
+    
     # Create cache directory
     cache_dir.mkdir(exist_ok=True)
     print(f"\nCache directory: {cache_dir}")
@@ -325,10 +370,23 @@ def cache_yolo_features(config: Config):
     
     print("  ✓ Both models loaded and frozen")
     
+    # Verify models are on expected device
+    pose_model_device = next(model_pose.model.parameters()).device
+    seg_model_device = next(model_seg.model.parameters()).device
+    print(f"  Pose model device: {pose_model_device}")
+    print(f"  Seg model device: {seg_model_device}")
+    
+    # DEVICE ASSERTION: Ensure models are on configured device
+    assert str(pose_model_device).startswith(device.split(':')[0]), \
+        f"Pose model on wrong device: {pose_model_device}, expected {device}"
+    assert str(seg_model_device).startswith(device.split(':')[0]), \
+        f"Seg model on wrong device: {seg_model_device}, expected {device}"
+    
     # Initialize feature extractor (using pose model backbone)
     print("  Initializing feature extractor (Backbone + ROI Align)")
     extractor = CachingFeatureExtractor(
         model_pose,
+        device=device,  # CRITICAL: Pass device for device-consistent operations
         feature_layer_idx=FEATURE_EXTRACTION_SETTINGS["feature_layer_idx"],
         output_dim=FEATURE_EXTRACTION_SETTINGS["output_dim"],
     )
@@ -455,6 +513,18 @@ def cache_yolo_features(config: Config):
             
             if has_nan_inf:
                 stats["nan_inf_count"] += 1
+            
+            # CRITICAL: Move all tensors to CPU before saving to disk
+            # This ensures cache files are device-agnostic and can be loaded anywhere
+            for key, value in cache_data.items():
+                if isinstance(value, torch.Tensor):
+                    cache_data[key] = value.cpu()
+            
+            # ASSERTION: Verify no CUDA tensors are being saved
+            for key, value in cache_data.items():
+                if isinstance(value, torch.Tensor):
+                    assert value.device == torch.device('cpu'), \
+                        f"CACHE ERROR: Tensor '{key}' is on {value.device}, must be on CPU for disk storage"
             
             # Save cache
             cache_path = cache_dir / f"{image_id}.pt"

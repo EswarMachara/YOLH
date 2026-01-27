@@ -169,7 +169,14 @@ class TrainableScorer(nn.Module):
 
 
 class SimpleQueryEncoder(nn.Module):
-    """Simple query encoder using transformers directly (avoid sentence-transformers TF issues)."""
+    """
+    Simple query encoder using transformers directly (avoid sentence-transformers TF issues).
+    
+    DEVICE CONTRACT:
+    - Module should be moved to device via .to(device) before use
+    - Forward pass handles moving tokenizer outputs to model device
+    - Output embedding is on same device as model
+    """
     
     def __init__(self):
         super().__init__()
@@ -190,6 +197,10 @@ class SimpleQueryEncoder(nn.Module):
         else:
             self.projection = None
     
+    def _get_device(self):
+        """Get device of model parameters."""
+        return next(self.model.parameters()).device
+    
     def mean_pooling(self, model_output, attention_mask):
         """Mean pooling - take mean of token embeddings weighted by attention mask."""
         token_embeddings = model_output[0]  # [B, seq_len, hidden_dim]
@@ -201,10 +212,16 @@ class SimpleQueryEncoder(nn.Module):
         Args:
             text: Caption string
         Returns:
-            embedding: [D_QUERY]
+            embedding: [D_QUERY] on same device as model
         """
+        device = self._get_device()
+        
         with torch.no_grad():
             encoded = self.tokenizer(text, padding=True, truncation=True, max_length=128, return_tensors='pt')
+            
+            # CRITICAL: Move tokenizer outputs to model device
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            
             model_output = self.model(**encoded)
             embedding = self.mean_pooling(model_output, encoded['attention_mask'])
             
@@ -316,6 +333,19 @@ def train_grounding(config: "Config"):
     print("\n" + "=" * 70)
     print("GROUNDING TRAINING WITH CACHED YOLO FEATURES")
     print("=" * 70)
+    
+    # =============================================================================
+    # DEVICE VALIDATION (Global Contract - STEP 1 of audit)
+    # =============================================================================
+    print(f"\nDevice configuration: {device}")
+    
+    # Assert CUDA availability if configured
+    if device.startswith("cuda"):
+        assert torch.cuda.is_available(), \
+            f"Config specifies device='{device}' but CUDA is not available!"
+        print(f"  ✓ CUDA available: {torch.cuda.get_device_name(0)}")
+    else:
+        print(f"  Running on CPU")
     
     # =============================================================================
     # TASK 0: VERIFY CACHE EXISTS (ABORT IF MISSING)
@@ -526,6 +556,22 @@ def _run_training_loop(
     mirl_loss_fn = MIRLLoss(margin=0.2, lambda_reject=0.1)
     print(f"✓ MIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
     
+    # =============================================================================
+    # DEVICE ASSERTIONS (Hard assertions per STEP 8)
+    # =============================================================================
+    def verify_module_device(module, name, expected_device):
+        """Verify all parameters of a module are on expected device."""
+        for param in module.parameters():
+            actual = str(param.device)
+            expected = expected_device.split(':')[0]  # Handle cuda:0 vs cuda
+            assert actual.startswith(expected), \
+                f"{name} device mismatch: parameter on {actual}, expected {expected_device}"
+    
+    verify_module_device(query_encoder, "query_encoder", device)
+    verify_module_device(adapter, "adapter", device)
+    verify_module_device(scorer, "scorer", device)
+    print(f"\n✓ All modules verified on device: {device}")
+    
     
     # =============================================================================
     # TASK 4: FREEZE POLICY & PARAMETER COUNT
@@ -645,7 +691,7 @@ def _run_training_loop(
             if step_counter >= max_steps_per_epoch * num_epochs:
                 break
             
-            # Extract batch data (batch_size=1)
+            # Extract batch data (batch_size=1) and move to device
             visual_embeddings = batch["visual_embeddings"][0].to(device)  # [N, 256]
             boxes = batch["boxes"][0].to(device)  # [N, 4]
             masks = batch["masks"][0].to(device)  # [N, 160, 160]
@@ -660,6 +706,12 @@ def _run_training_loop(
             if N == 0:
                 continue
             
+            # DEVICE ASSERTION: All input tensors must be on expected device
+            input_tensors = [visual_embeddings, boxes, masks, keypoints, valid]
+            for t in input_tensors:
+                assert str(t.device).startswith(device.split(':')[0]), \
+                    f"Input tensor device mismatch: {t.device} vs expected {device}"
+            
             # Ensure gt_index is valid
             if gt_index >= N:
                 gt_index = N - 1
@@ -671,6 +723,10 @@ def _run_training_loop(
             # 1. Encode query
             with torch.no_grad():
                 query_embedding = query_encoder(caption)  # [D_QUERY]
+            
+            # DEVICE ASSERTION: Query must be on same device
+            assert str(query_embedding.device).startswith(device.split(':')[0]), \
+                f"Query embedding device mismatch: {query_embedding.device} vs expected {device}"
             
             # 2. Use cached visual embeddings as tokens directly
             # visual_embeddings are already [N, 256] from cache

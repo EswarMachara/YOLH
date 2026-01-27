@@ -4,6 +4,10 @@ Phase 2: Visual Embeddings Feature Extraction Design & Validation
 This script designs and validates the permanent architectural choice for
 computing per-human visual embeddings from YOLO model outputs.
 
+⚠️ EXPLORATION SCRIPT - NOT FOR PRODUCTION USE
+   - Hardcoded CPU device for local development
+   - Use cache_yolo_features.py for device-aware production caching
+
 CPU-only. No training. No YOLO internals modification.
 """
 
