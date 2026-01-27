@@ -301,14 +301,13 @@ def train_grounding(config: "Config"):
     Args:
         config: Configuration object loaded from config.yaml
     """
-    # Resolve paths from config
-    project_root = Path(config.project_root)
-    cache_dir = project_root / config.cache.features_dir
-    checkpoint_dir = project_root / config.checkpoints.checkpoints_dir
-    coco_json = project_root / config.dataset.annotations_path
+    # Resolve paths from config using convenience properties
+    cache_dir = config.features_dir
+    checkpoint_dir = config.checkpoint_dir
+    coco_json = config.annotations_path
     
     # Training settings from config
-    device = config.runtime.device
+    device = config.training.device
     num_epochs = config.training.num_epochs
     batch_size = config.training.batch_size
     max_steps_per_epoch = config.training.max_steps_per_epoch

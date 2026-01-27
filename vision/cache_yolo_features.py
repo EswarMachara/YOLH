@@ -146,9 +146,9 @@ class CachingFeatureExtractor:
         roi_features = roi_align(
             feat,
             rois,
-            output_size=(CONFIG["roi_output_size"], CONFIG["roi_output_size"]),
+            output_size=(FEATURE_EXTRACTION_SETTINGS["roi_output_size"], FEATURE_EXTRACTION_SETTINGS["roi_output_size"]),
             spatial_scale=1.0,
-            sampling_ratio=CONFIG["sampling_ratio"],
+            sampling_ratio=FEATURE_EXTRACTION_SETTINGS["sampling_ratio"],
             aligned=True,
         )  # [N, C, 7, 7]
         
