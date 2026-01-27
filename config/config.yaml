@@ -4,9 +4,9 @@
 
 dataset:
   # Directory containing training images
-  images_dir: images_200
+  images_dir: data/images
   # Path to COCO-format annotations JSON
-  annotations_path: _annotations_COCO_final.json
+  annotations_path: data/annotations.json
 
 cache:
   # Directory for cached YOLO features
@@ -19,11 +19,11 @@ models:
 
 training:
   # Device: "cuda" for GPU, "cpu" for CPU-only
-  device: cpu
+  device: cuda
   # Batch size for training
-  batch_size: 1
+  batch_size: 8
   # Number of training epochs
-  num_epochs: 10
+  num_epochs: 20
   # DataLoader workers (0 for main thread)
   num_workers: 0
   # Learning rate

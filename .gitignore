@@ -1,71 +1,20 @@
-# -------------------------
-# Python
-# -------------------------
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.egg-info/
-dist/
-build/
+# ===== Datasets =====
+data/*.json
+data/images/
+data/images_200/
 
-# -------------------------
-# Virtual environments
-# -------------------------
-.env
-.venv
-venv/
-env/
+# ===== Notebooks =====
+*.ipynb
 
-# -------------------------
-# IDE / OS
-# -------------------------
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# -------------------------
-# Logs & checkpoints
-# -------------------------
-logs/
-*.log
-checkpoints/
-*.ckpt
-*.pt
-*.pth
-
-# -------------------------
-# Cached features (REGENERABLE)
-# -------------------------
+# ===== Training artifacts =====
 cache/
-feature_cache/
-yolo_cache/
-
-# -------------------------
-# Large datasets / images
-# -------------------------
-images/
-images_200/
-datasets/
-data/raw/
-data/processed/
-
-# -------------------------
-# COCO JSON (too large)
-# -------------------------
-*_annotations*.json
-*.jsonl
-
-# -------------------------
-# Training outputs
-# -------------------------
+checkpoints/
 runs/
-outputs/
-results/
+logs/
+wandb/
+lightning_logs/
 
-# -------------------------
-# Temporary / debug
-# -------------------------
-debug/
-tmp/
+# ===== Python cache =====
+__pycache__/
+*.pyc
+*.pyo

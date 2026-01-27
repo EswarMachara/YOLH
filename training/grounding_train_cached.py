@@ -6,11 +6,11 @@ Train ONLY the grounding components (adapter + scorer + MIRL) using
 precomputed YOLO features from cache. YOLO models are never loaded.
 
 CONSTRAINTS:
-- ❌ No YOLO inference
-- ❌ No YOLO unfreezing
-- ❌ No architecture modifications
-- ✅ Use cached .pt files only
-- ✅ Focus on learning behavior
+- No YOLO inference
+- No YOLO unfreezing
+- No architecture modifications
+- Use cached .pt files only
+- Focus on learning behavior
 
 USAGE:
     python training/grounding_train_cached.py --config config/config.yaml
@@ -28,32 +28,25 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import time
 from collections import defaultdict
-from typing import Dict, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from core.datatypes import (
-    D_VISION,
     D_TOKEN,
     D_QUERY,
-    H_MASK,
-    W_MASK,
-    K_KEYPOINTS,
 )
 
 if TYPE_CHECKING:
     from core.config import Config
 
-# We'll use simplified trainable adapter and scorer like sanity_train
-# since full architecture components may not exist yet
-
 
 # =============================================================================
-# TRAINABLE COMPONENTS (from sanity_train.py)
+# TRAINABLE COMPONENTS
 # =============================================================================
 
 class TrainableAdapter(nn.Module):
     """
     Trainable adapter for grounding (no torch.no_grad).
-    Uses query-conditioned feature modulation.
+    Uses query-conditioned feature modulation (FiLM-style).
     """
     
     def __init__(self, token_dim: int = 256, query_dim: int = 256):
@@ -61,27 +54,31 @@ class TrainableAdapter(nn.Module):
         self.token_dim = token_dim
         self.query_dim = query_dim
         
-        # Query-conditioned modulation
+        # Query-conditioned modulation (FiLM)
         self.gamma_generator = nn.Linear(query_dim, token_dim, bias=True)
         self.beta_generator = nn.Linear(query_dim, token_dim, bias=True)
         
         # Output projection
         self.output_proj = nn.Linear(token_dim, token_dim, bias=False)
         
+        # Initialize
+        nn.init.zeros_(self.gamma_generator.bias)
+        nn.init.zeros_(self.beta_generator.bias)
+        nn.init.orthogonal_(self.output_proj.weight)
+        
     def forward(self, tokens: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
         """
         Args:
             tokens: [B, N, token_dim] or [N, token_dim]
-            query: [query_dim] or [B, query_dim]
+            query: [B, query_dim] or [query_dim]
         Returns:
-            grounded_tokens: [B, N, token_dim] or [N, token_dim]
+            grounded_tokens: same shape as tokens
         """
         # Handle unbatched input
+        unbatch = False
         if tokens.dim() == 2:
             tokens = tokens.unsqueeze(0)  # [1, N, token_dim]
             unbatch = True
-        else:
-            unbatch = False
         
         if query.dim() == 1:
             query = query.unsqueeze(0)  # [1, query_dim]
@@ -92,25 +89,26 @@ class TrainableAdapter(nn.Module):
         gamma = self.gamma_generator(query)  # [B, token_dim]
         beta = self.beta_generator(query)    # [B, token_dim]
         
-        # Apply query-conditioned modulation
-        gamma_expanded = gamma.unsqueeze(1)  # [B, 1, token_dim]
-        beta_expanded = beta.unsqueeze(1)    # [B, 1, token_dim]
+        # Expand for broadcasting: [B, 1, token_dim]
+        gamma = gamma.unsqueeze(1)
+        beta = beta.unsqueeze(1)
         
-        modulated = tokens * (1.0 + gamma_expanded) + beta_expanded  # [B, N, token_dim]
+        # Apply FiLM modulation
+        modulated = tokens * (1.0 + gamma) + beta  # [B, N, token_dim]
         
         # Output projection
         output = self.output_proj(modulated)  # [B, N, token_dim]
         
         if unbatch:
-            output = output.squeeze(0)  # [N, token_dim]
+            output = output.squeeze(0)
         
         return output
 
 
 class TrainableScorer(nn.Module):
     """
-    Trainable scorer for grounding (no torch.no_grad).
-    Uses query-aware scoring.
+    Trainable scorer for grounding.
+    Uses query-aware scoring with MLP.
     """
     
     def __init__(self, token_dim: int = 256, query_dim: int = 256):
@@ -121,7 +119,7 @@ class TrainableScorer(nn.Module):
         # Query projection
         self.query_proj = nn.Linear(query_dim, token_dim, bias=False)
         
-        # Scoring MLP
+        # Scoring MLP: concat(token, query) -> score
         self.scorer = nn.Sequential(
             nn.Linear(token_dim * 2, 128),
             nn.ReLU(),
@@ -131,24 +129,26 @@ class TrainableScorer(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(64, 1),
         )
+        
+        # Initialize
+        nn.init.orthogonal_(self.query_proj.weight)
     
     def forward(self, tokens: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
         """
         Args:
             tokens: [B, N, token_dim] or [N, token_dim]
-            query: [query_dim] or [B, query_dim]
+            query: [B, query_dim] or [query_dim]
         Returns:
             scores: [B, N] or [N]
         """
         # Handle unbatched input
+        unbatch = False
         if tokens.dim() == 2:
-            tokens = tokens.unsqueeze(0)  # [1, N, token_dim]
+            tokens = tokens.unsqueeze(0)
             unbatch = True
-        else:
-            unbatch = False
         
         if query.dim() == 1:
-            query = query.unsqueeze(0)  # [1, query_dim]
+            query = query.unsqueeze(0)
         
         B, N, D = tokens.shape
         
@@ -157,86 +157,122 @@ class TrainableScorer(nn.Module):
         query_expanded = query_proj.unsqueeze(1).expand(B, N, -1)  # [B, N, token_dim]
         
         # Concatenate tokens with query
-        combined = torch.cat([tokens, query_expanded], dim=-1)  # [B, N, 2D]
+        combined = torch.cat([tokens, query_expanded], dim=-1)  # [B, N, 2*token_dim]
         
         # Score
         scores = self.scorer(combined).squeeze(-1)  # [B, N]
         
         if unbatch:
-            scores = scores.squeeze(0)  # [N]
+            scores = scores.squeeze(0)
         
         return scores
 
 
 class SimpleQueryEncoder(nn.Module):
     """
-    Simple query encoder using transformers directly (avoid sentence-transformers TF issues).
-    
-    DEVICE CONTRACT:
-    - Module should be moved to device via .to(device) before use
-    - Forward pass handles moving tokenizer outputs to model device
-    - Output embedding is on same device as model
+    Query encoder using sentence-transformers/all-MiniLM-L6-v2.
+    Outputs 256D embeddings (projected from 384D).
     """
     
     def __init__(self):
         super().__init__()
         from transformers import AutoTokenizer, AutoModel
         
-        # Use all-MiniLM-L6-v2 directly
         self.tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
         self.model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
         self.model.eval()
         
-        # Projection to query dim if needed
         # MiniLM outputs 384 dim, we need D_QUERY (256)
         if D_QUERY != 384:
             self.projection = nn.Linear(384, D_QUERY, bias=False)
             torch.manual_seed(42)
             nn.init.orthogonal_(self.projection.weight)
             self.projection.eval()
+            for p in self.projection.parameters():
+                p.requires_grad = False
         else:
             self.projection = None
     
-    def _get_device(self):
+    def _get_device(self) -> torch.device:
         """Get device of model parameters."""
         return next(self.model.parameters()).device
     
-    def mean_pooling(self, model_output, attention_mask):
-        """Mean pooling - take mean of token embeddings weighted by attention mask."""
+    def _mean_pooling(self, model_output, attention_mask) -> torch.Tensor:
+        """Mean pooling weighted by attention mask."""
         token_embeddings = model_output[0]  # [B, seq_len, hidden_dim]
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * mask_expanded, dim=1)
+        sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+        return sum_embeddings / sum_mask
     
     def forward(self, text: str) -> torch.Tensor:
         """
+        Encode a single text string.
+        
         Args:
             text: Caption string
         Returns:
-            embedding: [D_QUERY] on same device as model
+            embedding: [D_QUERY] tensor on same device as model
         """
         device = self._get_device()
         
         with torch.no_grad():
-            encoded = self.tokenizer(text, padding=True, truncation=True, max_length=128, return_tensors='pt')
-            
-            # CRITICAL: Move tokenizer outputs to model device
+            encoded = self.tokenizer(
+                text, 
+                padding=True, 
+                truncation=True, 
+                max_length=128, 
+                return_tensors='pt'
+            )
             encoded = {k: v.to(device) for k, v in encoded.items()}
             
             model_output = self.model(**encoded)
-            embedding = self.mean_pooling(model_output, encoded['attention_mask'])
-            
-            # Normalize
-            embedding = torch.nn.functional.normalize(embedding, p=2, dim=1).squeeze(0)  # [384]
+            embedding = self._mean_pooling(model_output, encoded['attention_mask'])
+            embedding = torch.nn.functional.normalize(embedding, p=2, dim=1).squeeze(0)
             
             if self.projection is not None:
-                embedding = self.projection(embedding)  # [D_QUERY]
+                embedding = self.projection(embedding)
         
         return embedding
+    
+    def forward_batch(self, texts: List[str]) -> torch.Tensor:
+        """
+        Encode a batch of text strings.
+        
+        Args:
+            texts: List of caption strings
+        Returns:
+            embeddings: [B, D_QUERY] tensor
+        """
+        device = self._get_device()
+        
+        with torch.no_grad():
+            encoded = self.tokenizer(
+                texts, 
+                padding=True, 
+                truncation=True, 
+                max_length=128, 
+                return_tensors='pt'
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            
+            model_output = self.model(**encoded)
+            embeddings = self._mean_pooling(model_output, encoded['attention_mask'])
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            
+            if self.projection is not None:
+                embeddings = self.projection(embeddings)
+        
+        return embeddings
 
 
 class MIRLLoss(nn.Module):
     """
     MIRL (Margin-based Instance Ranking Loss) for referring expression grounding.
+    
+    Components:
+    - Ranking loss: Encourage GT score > negative scores by margin
+    - Rejection loss: Encourage all scores to be positive (avoid collapse)
     """
     
     def __init__(self, margin: float = 0.2, lambda_reject: float = 0.1):
@@ -247,83 +283,801 @@ class MIRLLoss(nn.Module):
     def forward(
         self,
         scores: torch.Tensor,
-        labels: torch.Tensor,
+        gt_indices: torch.Tensor,
         valid: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
+        Compute MIRL loss for a batch.
+        
         Args:
-            scores: [N] predicted scores
-            labels: [N] binary labels (1=positive, 0=negative)
-            valid: [N] validity mask
+            scores: [B, N] predicted scores
+            gt_indices: [B] ground truth indices (-1 if no GT)
+            valid: [B, N] validity mask
         
         Returns:
-            loss_dict with keys: total, ranking, rejection
+            Dict with keys: total, ranking, rejection
         """
-        # Mask invalid humans
-        scores_masked = scores * valid.float()
+        B, N = scores.shape
+        device = scores.device
         
-        # Get positive and negative scores
-        pos_mask = (labels == 1) & valid
-        neg_mask = (labels == 0) & valid
+        total_ranking_loss = torch.tensor(0.0, device=device)
+        total_rejection_loss = torch.tensor(0.0, device=device)
+        valid_samples = 0
         
-        if not pos_mask.any():
-            # No positive, return zero loss
-            return {
-                "total": torch.tensor(0.0, requires_grad=True),
-                "ranking": torch.tensor(0.0),
-                "rejection": torch.tensor(0.0),
-            }
+        for b in range(B):
+            gt_idx = gt_indices[b].item()
+            valid_mask = valid[b]  # [N]
+            sample_scores = scores[b]  # [N]
+            
+            # Skip if no GT or GT is invalid
+            if gt_idx < 0 or gt_idx >= N or not valid_mask[gt_idx]:
+                continue
+            
+            valid_samples += 1
+            
+            # Get positive score
+            pos_score = sample_scores[gt_idx]
+            
+            # Get negative scores (valid and not GT)
+            neg_mask = valid_mask.clone()
+            neg_mask[gt_idx] = False
+            
+            if neg_mask.any():
+                neg_scores = sample_scores[neg_mask]
+                
+                # Ranking loss: max(0, margin - (pos - neg))
+                margins = pos_score - neg_scores  # [num_neg]
+                ranking_loss = torch.relu(self.margin - margins).mean()
+                total_ranking_loss = total_ranking_loss + ranking_loss
+            
+            # Rejection loss: encourage scores to be positive
+            valid_scores = sample_scores[valid_mask]
+            rejection_loss = torch.relu(-valid_scores).mean()
+            total_rejection_loss = total_rejection_loss + rejection_loss
         
-        pos_scores = scores_masked[pos_mask]
+        # Average over valid samples
+        if valid_samples > 0:
+            total_ranking_loss = total_ranking_loss / valid_samples
+            total_rejection_loss = total_rejection_loss / valid_samples
         
-        if not neg_mask.any():
-            # No negatives, only rejection loss
-            rejection_loss = torch.relu(-pos_scores).mean()
-            total = self.lambda_reject * rejection_loss
-            return {
-                "total": total,
-                "ranking": torch.tensor(0.0),
-                "rejection": rejection_loss,
-            }
-        
-        neg_scores = scores_masked[neg_mask]
-        
-        # Ranking loss: max(0, margin - (pos - neg))
-        pos_expanded = pos_scores.unsqueeze(1)  # [P, 1]
-        neg_expanded = neg_scores.unsqueeze(0)  # [1, N]
-        
-        margins = pos_expanded - neg_expanded  # [P, N]
-        ranking_loss = torch.relu(self.margin - margins).mean()
-        
-        # Rejection loss: max(0, -score) for all instances
-        rejection_loss = torch.relu(-scores_masked[valid]).mean()
-        
-        total = ranking_loss + self.lambda_reject * rejection_loss
+        total = total_ranking_loss + self.lambda_reject * total_rejection_loss
         
         return {
             "total": total,
-            "ranking": ranking_loss,
-            "rejection": rejection_loss,
+            "ranking": total_ranking_loss,
+            "rejection": total_rejection_loss,
         }
 
 
 # =============================================================================
-# MAIN TRAINING FUNCTION
+# CUSTOM COLLATE FUNCTION
+# =============================================================================
+
+def collate_variable_humans(batch: List[Dict]) -> Optional[Dict]:
+    """
+    Custom collate function for batches with variable number of humans per image.
+    Pads all tensors to the maximum number of humans in the batch.
+    
+    Args:
+        batch: List of sample dicts from dataset
+        
+    Returns:
+        Batched dict with padded tensors, or None if batch is empty
+    """
+    # Filter out None samples
+    batch = [s for s in batch if s is not None]
+    
+    if len(batch) == 0:
+        return None
+    
+    # Find max humans in this batch
+    max_humans = max(sample['visual_embeddings'].shape[0] for sample in batch)
+    
+    if max_humans == 0:
+        return None
+    
+    batch_size = len(batch)
+    
+    # Get dimensions from first valid sample
+    embed_dim = batch[0]['visual_embeddings'].shape[1]
+    
+    # Handle masks shape
+    first_masks = batch[0]['masks']
+    if first_masks.dim() == 3:
+        mask_h, mask_w = first_masks.shape[1], first_masks.shape[2]
+    else:
+        mask_h, mask_w = 160, 160
+    
+    # Initialize padded tensors
+    visual_embeddings = torch.zeros(batch_size, max_humans, embed_dim)
+    boxes = torch.zeros(batch_size, max_humans, 4)
+    masks = torch.zeros(batch_size, max_humans, mask_h, mask_w)
+    keypoints = torch.zeros(batch_size, max_humans, 17, 3)
+    valid = torch.zeros(batch_size, max_humans, dtype=torch.bool)
+    
+    captions = []
+    gt_indices = []
+    image_ids = []
+    
+    for i, sample in enumerate(batch):
+        n_humans = sample['visual_embeddings'].shape[0]
+        
+        if n_humans > 0:
+            visual_embeddings[i, :n_humans] = sample['visual_embeddings']
+            boxes[i, :n_humans] = sample['boxes']
+            keypoints[i, :n_humans] = sample['keypoints']
+            
+            # Handle masks
+            sample_masks = sample['masks']
+            if sample_masks.dim() == 3 and sample_masks.shape[0] == n_humans:
+                # Resize if needed
+                if sample_masks.shape[1] != mask_h or sample_masks.shape[2] != mask_w:
+                    sample_masks = torch.nn.functional.interpolate(
+                        sample_masks.unsqueeze(1).float(),
+                        size=(mask_h, mask_w),
+                        mode='nearest'
+                    ).squeeze(1)
+                masks[i, :n_humans] = sample_masks
+            
+            # Handle valid mask
+            sample_valid = sample['valid']
+            if sample_valid.shape[0] == n_humans:
+                valid[i, :n_humans] = sample_valid
+            else:
+                valid[i, :n_humans] = True
+        
+        captions.append(sample['caption'])
+        
+        # GT index validation
+        gt_idx = sample['gt_index']
+        if not isinstance(gt_idx, int):
+            gt_idx = int(gt_idx)
+        if gt_idx >= n_humans or gt_idx < 0:
+            gt_idx = -1  # Mark as invalid
+        gt_indices.append(gt_idx)
+        
+        image_ids.append(sample.get('image_id', i))
+    
+    return {
+        'visual_embeddings': visual_embeddings,
+        'boxes': boxes,
+        'masks': masks,
+        'keypoints': keypoints,
+        'valid': valid,
+        'caption': captions,
+        'gt_index': torch.tensor(gt_indices, dtype=torch.long),
+        'image_id': image_ids,
+    }
+
+
+# =============================================================================
+# CACHED FEATURE DATASET
+# =============================================================================
+
+class CachedFeatureDataset(Dataset):
+    """
+    Dataset that loads precomputed YOLO features from cache.
+    
+    Each sample contains:
+    - visual_embeddings: [N, 256]
+    - boxes: [N, 4]
+    - masks: [N, H, W]
+    - keypoints: [N, 17, 3]
+    - valid: [N]
+    - caption: str
+    - gt_index: int
+    """
+    
+    def __init__(
+        self, 
+        cache_dir: Path, 
+        coco_json_path: Path, 
+        max_samples: Optional[int] = None,
+        seed: int = 42,
+    ):
+        self.cache_dir = cache_dir
+        self.seed = seed
+        
+        # Get all cache files
+        all_cache_files = sorted(list(cache_dir.glob("*.pt")))
+        
+        print(f"\nCachedFeatureDataset initializing...")
+        print(f"  Cache directory: {cache_dir}")
+        print(f"  Total cache files found: {len(all_cache_files)}")
+        
+        # Load COCO annotations
+        print(f"  Loading COCO annotations from: {coco_json_path}")
+        with open(coco_json_path, 'r') as f:
+            coco_data = json.load(f)
+        
+        # Build mapping: image_id -> list of annotations
+        self.image_id_to_anns = defaultdict(list)
+        for ann in coco_data['annotations']:
+            image_id = str(ann['image_id'])
+            self.image_id_to_anns[image_id].append(ann)
+        
+        print(f"  COCO annotations loaded: {len(coco_data['annotations'])}")
+        print(f"  Unique images with annotations: {len(self.image_id_to_anns)}")
+        
+        # Build valid sample list (without loading all cache files)
+        self.samples = []
+        
+        for cache_file in tqdm(all_cache_files, desc="  Validating cache files"):
+            image_id = cache_file.stem
+            
+            # Check if annotations exist for this image
+            if image_id not in self.image_id_to_anns:
+                continue
+            
+            # Get all annotations for this image
+            anns = self.image_id_to_anns[image_id]
+            
+            # Create one sample per annotation (each caption is a separate sample)
+            for ann_idx, ann in enumerate(anns):
+                if 'caption' not in ann or not ann['caption']:
+                    continue
+                
+                self.samples.append({
+                    'cache_file': cache_file,
+                    'image_id': image_id,
+                    'ann_idx': ann_idx,
+                    'caption': ann['caption'],
+                    'bbox': ann.get('bbox', None),
+                })
+        
+        print(f"  Valid samples (image + caption pairs): {len(self.samples)}")
+        
+        # Limit samples if requested
+        if max_samples is not None and len(self.samples) > max_samples:
+            import random
+            random.seed(seed)
+            random.shuffle(self.samples)
+            self.samples = self.samples[:max_samples]
+            print(f"  Limited to: {len(self.samples)} samples")
+        
+        # Cache for loaded features (LRU-style, limited size)
+        self._cache = {}
+        self._cache_max_size = 100
+    
+    def __len__(self) -> int:
+        return len(self.samples)
+    
+    def _load_cache_file(self, cache_file: Path) -> Dict:
+        """Load cache file with simple caching."""
+        cache_key = str(cache_file)
+        
+        if cache_key not in self._cache:
+            # Evict oldest if cache is full
+            if len(self._cache) >= self._cache_max_size:
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+            
+            self._cache[cache_key] = torch.load(cache_file, weights_only=True)
+        
+        return self._cache[cache_key]
+    
+    def _match_gt_index(
+        self, 
+        ann_bbox: Optional[List[float]], 
+        cached_boxes: torch.Tensor,
+    ) -> int:
+        """
+        Match annotation bbox to cached detection boxes using IoU.
+        
+        Args:
+            ann_bbox: [x, y, w, h] from COCO annotation (can be None)
+            cached_boxes: [N, 4] normalized xyxy boxes from cache
+            
+        Returns:
+            Best matching index, or 0 if no bbox provided
+        """
+        N = cached_boxes.shape[0]
+        
+        if ann_bbox is None or N == 0:
+            return 0
+        
+        # Convert annotation bbox from [x, y, w, h] to normalized [x1, y1, x2, y2]
+        # Note: COCO bbox is in pixels, cached boxes are normalized [0, 1]
+        # We need image dimensions for proper conversion
+        # For now, use simple heuristic: find box with highest IoU
+        
+        # Assume annotation bbox is already somewhat normalized or use center matching
+        x, y, w, h = ann_bbox
+        ann_cx = x + w / 2
+        ann_cy = y + h / 2
+        
+        # Find closest box by center distance (simple heuristic)
+        best_idx = 0
+        best_dist = float('inf')
+        
+        for i in range(N):
+            box = cached_boxes[i]
+            box_cx = (box[0] + box[2]) / 2
+            box_cy = (box[1] + box[3]) / 2
+            
+            # Normalize annotation center (assume image ~640px)
+            ann_cx_norm = ann_cx / 640
+            ann_cy_norm = ann_cy / 640
+            
+            dist = (box_cx - ann_cx_norm) ** 2 + (box_cy - ann_cy_norm) ** 2
+            
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        
+        return best_idx
+    
+    def __getitem__(self, idx: int) -> Optional[Dict]:
+        sample_info = self.samples[idx]
+        cache_file = sample_info['cache_file']
+        
+        try:
+            # Load cached features
+            cache_data = self._load_cache_file(cache_file)
+            
+            visual_embeddings = cache_data['visual_embeddings']
+            boxes = cache_data['boxes']
+            masks = cache_data['masks']
+            keypoints = cache_data['keypoints']
+            valid = cache_data['valid']
+            
+            N = boxes.shape[0]
+            
+            # Skip if no humans
+            if N == 0:
+                return None
+            
+            # Get caption from sample info
+            caption = sample_info['caption']
+            
+            # Match GT index
+            gt_index = self._match_gt_index(sample_info.get('bbox'), boxes)
+            
+            # Ensure gt_index is valid
+            if gt_index >= N:
+                gt_index = N - 1
+            
+            return {
+                "visual_embeddings": visual_embeddings,
+                "boxes": boxes,
+                "masks": masks,
+                "keypoints": keypoints,
+                "valid": valid,
+                "caption": caption,
+                "gt_index": gt_index,
+                "image_id": sample_info['image_id'],
+            }
+            
+        except Exception as e:
+            print(f"Warning: Failed to load {cache_file}: {e}")
+            return None
+
+
+# =============================================================================
+# TRAINING LOOP
+# =============================================================================
+
+def _run_training_loop(
+    config: "Config",
+    cache_dir: Path,
+    checkpoint_dir: Path,
+    coco_json: Path,
+    device: str,
+    num_epochs: int,
+    batch_size: int,
+    max_steps_per_epoch: Optional[int],
+    learning_rate: float,
+):
+    """Internal training loop."""
+    
+    # =========================================================================
+    # TASK 3: MODEL INITIALIZATION
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("TASK 3: Initializing model components (NO YOLO)")
+    print("-" * 50)
+    
+    # Query encoder (frozen)
+    query_encoder = SimpleQueryEncoder()
+    query_encoder.to(device)
+    query_encoder.eval()
+    for param in query_encoder.parameters():
+        param.requires_grad = False
+    print(f"✓ SimpleQueryEncoder loaded (frozen)")
+    
+    # Grounding adapter (trainable)
+    adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
+    adapter.to(device)
+    adapter.train()
+    print(f"✓ TrainableAdapter initialized (trainable)")
+    
+    # Scorer (trainable)
+    scorer = TrainableScorer(token_dim=D_TOKEN, query_dim=D_QUERY)
+    scorer.to(device)
+    scorer.train()
+    print(f"✓ TrainableScorer initialized (trainable)")
+    
+    # MIRL loss
+    mirl_loss_fn = MIRLLoss(margin=0.2, lambda_reject=0.1)
+    print(f"✓ MIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
+    
+    # Device verification
+    def verify_device(module, name, expected):
+        for param in module.parameters():
+            actual = str(param.device)
+            assert actual.startswith(expected.split(':')[0]), \
+                f"{name} device mismatch: {actual} vs {expected}"
+    
+    verify_device(query_encoder, "query_encoder", device)
+    verify_device(adapter, "adapter", device)
+    verify_device(scorer, "scorer", device)
+    print(f"\n✓ All modules verified on device: {device}")
+    
+    # =========================================================================
+    # TASK 4: PARAMETER COUNTING
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("TASK 4: Freeze policy and parameter counting")
+    print("-" * 50)
+    
+    def count_params(module):
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+    
+    modules = [
+        ("SimpleQueryEncoder", query_encoder),
+        ("TrainableAdapter", adapter),
+        ("TrainableScorer", scorer),
+    ]
+    
+    print("\nParameter counts:")
+    total_all, trainable_all = 0, 0
+    for name, module in modules:
+        total, trainable = count_params(module)
+        total_all += total
+        trainable_all += trainable
+        print(f"  {name:30s} - Total: {total:>10,} | Trainable: {trainable:>10,}")
+    print(f"  {'TOTAL':30s} - Total: {total_all:>10,} | Trainable: {trainable_all:>10,}")
+    
+    print(f"\nTrainable modules:")
+    for name, module in modules:
+        if any(p.requires_grad for p in module.parameters()):
+            print(f"  ✓ {name}")
+    
+    print(f"\nFrozen modules:")
+    for name, module in modules:
+        if not any(p.requires_grad for p in module.parameters()):
+            print(f"  ❄ {name}")
+    
+    # =========================================================================
+    # TASK 5: DATASET AND OPTIMIZER
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("TASK 5: Preparing training loop")
+    print("-" * 50)
+    
+    # Compute max_samples safely
+    if max_steps_per_epoch is not None:
+        max_samples = max_steps_per_epoch * batch_size * num_epochs
+    else:
+        max_samples = None
+    
+    dataset = CachedFeatureDataset(
+        cache_dir=cache_dir,
+        coco_json_path=coco_json,
+        max_samples=max_samples,
+        seed=config.runtime.seed,
+    )
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_variable_humans,
+        drop_last=True,
+    )
+    
+    print(f"✓ DataLoader ready ({len(dataset)} samples, batch_size={batch_size})")
+    
+    # Optimizer
+    trainable_params = list(adapter.parameters()) + list(scorer.parameters())
+    optimizer = torch.optim.AdamW(
+        trainable_params, 
+        lr=learning_rate,
+        weight_decay=config.training.weight_decay,
+    )
+    print(f"✓ Optimizer initialized (AdamW, lr={learning_rate})")
+    
+    # Learning rate scheduler
+    total_steps = len(dataloader) * num_epochs
+    if max_steps_per_epoch is not None:
+        total_steps = min(total_steps, max_steps_per_epoch * num_epochs)
+    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=total_steps,
+        eta_min=learning_rate * 0.01,
+    )
+    print(f"✓ Scheduler initialized (CosineAnnealing, T_max={total_steps})")
+    
+    # =========================================================================
+    # TASK 6-7: TRAINING LOOP WITH LOGGING
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("TASK 6-7: Running grounding training with logging")
+    print("-" * 50)
+    
+    # Logging
+    training_log = {
+        "losses": [],
+        "positive_scores": [],
+        "max_negative_scores": [],
+        "margins": [],
+    }
+    
+    best_margin_rate = 0.0
+    best_checkpoint_path = None
+    step_counter = 0
+    start_time = time.time()
+    
+    for epoch in range(num_epochs):
+        print(f"\n{'='*70}")
+        print(f"EPOCH {epoch + 1}/{num_epochs}")
+        print(f"{'='*70}")
+        
+        epoch_losses = []
+        epoch_margins = []
+        
+        adapter.train()
+        scorer.train()
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        
+        for batch_idx, batch in enumerate(pbar):
+            # Check step limit
+            if max_steps_per_epoch is not None and batch_idx >= max_steps_per_epoch:
+                break
+            
+            # Skip invalid batches
+            if batch is None:
+                continue
+            
+            # Move batch to device
+            visual_embeddings = batch['visual_embeddings'].to(device)  # [B, N, 256]
+            boxes = batch['boxes'].to(device)
+            valid = batch['valid'].to(device)  # [B, N]
+            captions = batch['caption']  # List[str]
+            gt_indices = batch['gt_index'].to(device)  # [B]
+            
+            B, N, D = visual_embeddings.shape
+            
+            # Skip empty batches
+            if B == 0 or N == 0:
+                continue
+            
+            # =================================================================
+            # FORWARD PASS
+            # =================================================================
+            
+            # 1. Encode queries (batched)
+            with torch.no_grad():
+                query_embeddings = query_encoder.forward_batch(captions)  # [B, D_QUERY]
+            
+            # 2. Apply adapter to each sample in batch
+            # Process batch: visual_embeddings [B, N, D], query [B, D_QUERY]
+            grounded_tokens = adapter(visual_embeddings, query_embeddings)  # [B, N, D]
+            
+            # 3. Score humans
+            scores = scorer(grounded_tokens, query_embeddings)  # [B, N]
+            
+            # =================================================================
+            # COMPUTE LOSS
+            # =================================================================
+            
+            loss_dict = mirl_loss_fn(scores, gt_indices, valid)
+            total_loss = loss_dict["total"]
+            
+            # Skip if loss is invalid
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"Warning: Invalid loss at step {step_counter}, skipping")
+                continue
+            
+            # =================================================================
+            # BACKWARD & OPTIMIZE
+            # =================================================================
+            
+            optimizer.zero_grad()
+            total_loss.backward()
+            
+            # Gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_params, 
+                max_norm=config.training.grad_clip_norm
+            )
+            
+            optimizer.step()
+            scheduler.step()
+            
+            # =================================================================
+            # LOGGING
+            # =================================================================
+            
+            # Compute metrics for logging
+            with torch.no_grad():
+                batch_margins = []
+                batch_pos_scores = []
+                batch_neg_scores = []
+                
+                for b in range(B):
+                    gt_idx = gt_indices[b].item()
+                    if gt_idx < 0 or gt_idx >= N:
+                        continue
+                    
+                    pos_score = scores[b, gt_idx].item()
+                    batch_pos_scores.append(pos_score)
+                    
+                    # Get max negative score
+                    neg_mask = valid[b].clone()
+                    neg_mask[gt_idx] = False
+                    
+                    if neg_mask.any():
+                        max_neg = scores[b][neg_mask].max().item()
+                        batch_neg_scores.append(max_neg)
+                        batch_margins.append(pos_score - max_neg)
+                
+                if batch_pos_scores:
+                    avg_pos = sum(batch_pos_scores) / len(batch_pos_scores)
+                    training_log["positive_scores"].append(avg_pos)
+                
+                if batch_neg_scores:
+                    avg_neg = sum(batch_neg_scores) / len(batch_neg_scores)
+                    training_log["max_negative_scores"].append(avg_neg)
+                
+                if batch_margins:
+                    avg_margin = sum(batch_margins) / len(batch_margins)
+                    training_log["margins"].append(avg_margin)
+                    epoch_margins.append(avg_margin)
+            
+            loss_val = total_loss.item()
+            training_log["losses"].append(loss_val)
+            epoch_losses.append(loss_val)
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{loss_val:.4f}',
+                'margin': f'{avg_margin:.4f}' if batch_margins else 'N/A',
+                'lr': f'{scheduler.get_last_lr()[0]:.2e}',
+            })
+            
+            # Detailed logging every N steps
+            if step_counter % 50 == 0:
+                print(f"\nStep {step_counter}:")
+                print(f"  Loss:          {loss_val:.4f}")
+                print(f"  GT score:      {avg_pos:.4f}" if batch_pos_scores else "  GT score:      N/A")
+                print(f"  Max neg score: {avg_neg:.4f}" if batch_neg_scores else "  Max neg score: N/A")
+                print(f"  Margin:        {avg_margin:+.4f}" if batch_margins else "  Margin:        N/A")
+                print(f"  Grad norm:     {grad_norm:.4f}")
+                print(f"  LR:            {scheduler.get_last_lr()[0]:.2e}")
+            
+            step_counter += 1
+        
+        # Epoch summary
+        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0
+        margin_success = sum(1 for m in epoch_margins if m > 0) / len(epoch_margins) if epoch_margins else 0
+        
+        print(f"\nEpoch {epoch + 1} summary:")
+        print(f"  Average loss: {avg_loss:.4f}")
+        print(f"  Margin success rate: {margin_success*100:.1f}%")
+        print(f"  Steps completed: {len(epoch_losses)}")
+        
+        # Save checkpoint
+        checkpoint_path = checkpoint_dir / f"epoch_{epoch + 1}.pt"
+        torch.save({
+            "epoch": epoch + 1,
+            "adapter": adapter.state_dict(),
+            "scorer": scorer.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "step_counter": step_counter,
+            "margin_success_rate": margin_success,
+        }, checkpoint_path)
+        print(f"  Checkpoint saved: {checkpoint_path}")
+        
+        # Save best model
+        if margin_success > best_margin_rate:
+            best_margin_rate = margin_success
+            best_checkpoint_path = checkpoint_dir / "best_model.pt"
+            torch.save({
+                "epoch": epoch + 1,
+                "adapter": adapter.state_dict(),
+                "scorer": scorer.state_dict(),
+                "margin_success_rate": margin_success,
+            }, best_checkpoint_path)
+            print(f"  ★ New best model saved: {best_checkpoint_path} (margin: {margin_success*100:.1f}%)")
+    
+    elapsed = time.time() - start_time
+    print(f"\n{'='*70}")
+    print(f"TRAINING COMPLETED")
+    print(f"{'='*70}")
+    print(f"Total time: {elapsed:.1f}s ({elapsed/max(step_counter,1):.3f}s/step)")
+    print(f"Best margin success rate: {best_margin_rate*100:.1f}%")
+    if best_checkpoint_path:
+        print(f"Best model: {best_checkpoint_path}")
+    
+    # =========================================================================
+    # TASK 8: FINAL VERDICT
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("TASK 8: Final Verdict")
+    print("-" * 50)
+    
+    # Checks
+    losses = training_log["losses"]
+    margins = training_log["margins"]
+    pos_scores = training_log["positive_scores"]
+    
+    if len(losses) < 10:
+        print("\n⚠ Not enough steps for proper evaluation")
+        return
+    
+    # Check 1: Loss decreased
+    first_losses = losses[:min(10, len(losses))]
+    last_losses = losses[-min(10, len(losses)):]
+    loss_decreased = sum(last_losses)/len(last_losses) < sum(first_losses)/len(first_losses)
+    
+    # Check 2: GT scores increased
+    first_pos = pos_scores[:min(10, len(pos_scores))]
+    last_pos = pos_scores[-min(10, len(pos_scores)):]
+    gt_increased = sum(last_pos)/len(last_pos) > sum(first_pos)/len(first_pos) if pos_scores else False
+    
+    # Check 3: Margin success rate
+    positive_margins = [m for m in margins if m > 0]
+    margin_success = len(positive_margins) / len(margins) if margins else 0
+    
+    # Check 4: No NaN/Inf
+    has_nan = any(not torch.isfinite(torch.tensor(l)) for l in losses)
+    
+    print(f"\nChecks:")
+    print(f"  Loss decreased:           {'✓' if loss_decreased else '✗'}")
+    print(f"  GT scores increased:      {'✓' if gt_increased else '✗'}")
+    print(f"  Margin success rate:      {margin_success*100:.1f}% {'✓' if margin_success > 0.5 else '✗'}")
+    print(f"  No NaN/Inf:               {'✓' if not has_nan else '✗'}")
+    
+    print(f"\nFirst 5 losses: {[f'{l:.4f}' for l in losses[:5]]}")
+    print(f"Last 5 losses:  {[f'{l:.4f}' for l in losses[-5:]]}")
+    print(f"Last 5 margins: {[f'{m:+.4f}' for m in margins[-5:]]}")
+    
+    all_passed = loss_decreased and gt_increased and margin_success > 0.5 and not has_nan
+    
+    if all_passed:
+        print(f"\n{'='*70}")
+        print("✅ GROUNDING TRAINING PASSED")
+        print("="*70)
+    else:
+        print(f"\n{'='*70}")
+        print("❌ GROUNDING TRAINING NEEDS MORE EPOCHS")
+        print("="*70)
+        print("The model is learning but needs more training time.")
+
+
+# =============================================================================
+# MAIN ENTRY POINT
 # =============================================================================
 
 def train_grounding(config: "Config"):
-    """
-    Main training function using configuration.
+    """Main training function."""
     
-    Args:
-        config: Configuration object loaded from config.yaml
-    """
-    # Resolve paths from config using convenience properties
     cache_dir = config.features_dir
     checkpoint_dir = config.checkpoint_dir
     coco_json = config.annotations_path
     
-    # Training settings from config
     device = config.training.device
     num_epochs = config.training.num_epochs
     batch_size = config.training.batch_size
@@ -334,45 +1088,31 @@ def train_grounding(config: "Config"):
     print("GROUNDING TRAINING WITH CACHED YOLO FEATURES")
     print("=" * 70)
     
-    # =============================================================================
-    # DEVICE VALIDATION (Global Contract - STEP 1 of audit)
-    # =============================================================================
+    # Device validation
     print(f"\nDevice configuration: {device}")
-    
-    # Assert CUDA availability if configured
     if device.startswith("cuda"):
         assert torch.cuda.is_available(), \
             f"Config specifies device='{device}' but CUDA is not available!"
         print(f"  ✓ CUDA available: {torch.cuda.get_device_name(0)}")
-    else:
-        print(f"  Running on CPU")
-    
-    # =============================================================================
-    # TASK 0: VERIFY CACHE EXISTS (ABORT IF MISSING)
-    # =============================================================================
     
     # Verify cache
     if not cache_dir.exists():
-        print("\n❌ ABORT: Cache directory not found!")
-        print(f"   Expected: {cache_dir}")
+        print(f"\n❌ ABORT: Cache directory not found: {cache_dir}")
         sys.exit(1)
     
     cache_files = list(cache_dir.glob("*.pt"))
     if len(cache_files) == 0:
-        print("\n❌ ABORT: No cached .pt files found!")
+        print(f"\n❌ ABORT: No cached .pt files found in {cache_dir}")
         sys.exit(1)
     
     print(f"\nCache found: YES")
     print(f"Cached images: {len(cache_files)}")
     
     # Create checkpoint directory
-    checkpoint_dir.mkdir(exist_ok=True)
+    checkpoint_dir.mkdir(exist_ok=True, parents=True)
     print(f"Checkpoint directory: {checkpoint_dir}")
     
-    # =============================================================================
-    # TASK 1: TRAINING CONFIGURATION (FROM CONFIG FILE)
-    # =============================================================================
-    
+    # Print config
     print(f"\nConfiguration (from config file):")
     print(f"  num_epochs: {num_epochs}")
     print(f"  batch_size: {batch_size}")
@@ -380,7 +1120,7 @@ def train_grounding(config: "Config"):
     print(f"  learning_rate: {learning_rate}")
     print(f"  device: {device}")
     
-    # Run training loop
+    # Run training
     _run_training_loop(
         config=config,
         cache_dir=cache_dir,
@@ -394,591 +1134,15 @@ def train_grounding(config: "Config"):
     )
 
 
-# =============================================================================
-# TASK 2: CACHED FEATURE DATASET
-# =============================================================================
-
-class CachedFeatureDataset(Dataset):
-    """
-    Dataset that loads precomputed YOLO features from cache.
-    
-    Returns per sample:
-    {
-        "visual_embeddings": Tensor[N, 256],
-        "boxes": Tensor[N, 4],
-        "masks": Tensor[N, H, W],
-        "keypoints": Tensor[N, 17, 3],
-        "valid": Tensor[N],
-        "caption": str,
-        "gt_index": int
-    }
-    """
-    
-    def __init__(self, cache_dir: Path, coco_json_path: Path, max_samples: int = None):
-        self.cache_dir = cache_dir
-        self.cache_files = sorted(list(cache_dir.glob("*.pt")))
-        
-        if max_samples is not None:
-            self.cache_files = self.cache_files[:max_samples]
-        
-        # Load COCO annotations to get captions
-        with open(coco_json_path, 'r') as f:
-            coco_data = json.load(f)
-        
-        # Build mapping: image_id -> list of annotations
-        self.image_id_to_anns = defaultdict(list)
-        for ann in coco_data['annotations']:
-            image_id = str(ann['image_id'])  # Convert to string to match cache
-            self.image_id_to_anns[image_id].append(ann)
-        
-        # Filter: keep only cache files with annotations and humans
-        valid_cache_files = []
-        for cf in self.cache_files:
-            image_id = cf.stem
-            
-            # Check if annotations exist
-            if image_id not in self.image_id_to_anns:
-                continue
-            
-            # Check if cache has humans
-            cache_data = torch.load(cf, weights_only=True)
-            N = cache_data['boxes'].shape[0]
-            if N == 0:
-                continue
-            
-            valid_cache_files.append(cf)
-        
-        self.cache_files = valid_cache_files
-        
-        print(f"\nCachedFeatureDataset initialized:")
-        print(f"  Cache directory: {cache_dir}")
-        print(f"  Total cache files: {len(self.cache_files)}")
-        print(f"  COCO annotations loaded: {len(coco_data['annotations'])}")
-    
-    def __len__(self):
-        return len(self.cache_files)
-    
-    def __getitem__(self, idx):
-        cache_file = self.cache_files[idx]
-        image_id = cache_file.stem
-        
-        # Load cached features
-        cache_data = torch.load(cache_file, weights_only=True)
-        
-        visual_embeddings = cache_data['visual_embeddings']  # [N, 256]
-        boxes = cache_data['boxes']  # [N, 4]
-        masks = cache_data['masks']  # [N, 160, 160]
-        keypoints = cache_data['keypoints']  # [N, 17, 3]
-        valid = cache_data['valid']  # [N]
-        
-        N = boxes.shape[0]
-        
-        # Get annotations for this image
-        anns = self.image_id_to_anns[image_id]
-        
-        # Select a random annotation as ground truth
-        import random
-        random.seed(42 + idx)  # Deterministic
-        gt_ann = random.choice(anns)
-        caption = gt_ann['caption']
-        
-        # Determine GT index by matching bbox
-        # (simplified: use first annotation's index as GT)
-        # In real scenario, match by IoU with cached boxes
-        gt_index = 0  # Simplified: always use first human as GT
-        
-        # Ensure GT index is valid
-        if gt_index >= N:
-            gt_index = N - 1
-        
-        return {
-            "visual_embeddings": visual_embeddings,
-            "boxes": boxes,
-            "masks": masks,
-            "keypoints": keypoints,
-            "valid": valid,
-            "caption": caption,
-            "gt_index": gt_index,
-        }
-
-
-def _run_training_loop(
-    config: "Config",
-    cache_dir: Path,
-    checkpoint_dir: Path,
-    coco_json: Path,
-    device: str,
-    num_epochs: int,
-    batch_size: int,
-    max_steps_per_epoch: int,
-    learning_rate: float,
-):
-    """Internal training loop, called by train_grounding()."""
-    
-    # =============================================================================
-    # TASK 3: MODEL INITIALIZATION (NO YOLO)
-    # =============================================================================
-    
-    print("\n" + "-" * 50)
-    print("TASK 3: Initializing model components (NO YOLO)")
-    print("-" * 50)
-    
-    # Query encoder (frozen)
-    query_encoder = SimpleQueryEncoder()
-    query_encoder.to(device)
-    query_encoder.eval()
-    for param in query_encoder.parameters():
-        param.requires_grad = False
-    
-    print(f"✓ SimpleQueryEncoder loaded (frozen)")
-    
-    # Grounding adapter (trainable)
-    adapter = TrainableAdapter(
-        token_dim=D_TOKEN,
-        query_dim=D_QUERY,
-    )
-    adapter.to(device)
-    adapter.train()
-    
-    print(f"✓ TrainableAdapter initialized (trainable)")
-    
-    # Scorer (trainable)
-    scorer = TrainableScorer(
-        token_dim=D_TOKEN,
-        query_dim=D_QUERY,
-    )
-    scorer.to(device)
-    scorer.train()
-    
-    print(f"✓ TrainableScorer initialized (trainable)")
-    
-    # MIRL loss
-    mirl_loss_fn = MIRLLoss(margin=0.2, lambda_reject=0.1)
-    print(f"✓ MIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
-    
-    # =============================================================================
-    # DEVICE ASSERTIONS (Hard assertions per STEP 8)
-    # =============================================================================
-    def verify_module_device(module, name, expected_device):
-        """Verify all parameters of a module are on expected device."""
-        for param in module.parameters():
-            actual = str(param.device)
-            expected = expected_device.split(':')[0]  # Handle cuda:0 vs cuda
-            assert actual.startswith(expected), \
-                f"{name} device mismatch: parameter on {actual}, expected {expected_device}"
-    
-    verify_module_device(query_encoder, "query_encoder", device)
-    verify_module_device(adapter, "adapter", device)
-    verify_module_device(scorer, "scorer", device)
-    print(f"\n✓ All modules verified on device: {device}")
-    
-    
-    # =============================================================================
-    # TASK 4: FREEZE POLICY & PARAMETER COUNT
-    # =============================================================================
-    
-    print("\n" + "-" * 50)
-    print("TASK 4: Freeze policy and parameter counting")
-    print("-" * 50)
-    
-    # Count parameters
-    def count_parameters(module, name):
-        total = sum(p.numel() for p in module.parameters())
-        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-        return total, trainable
-    
-    modules_to_count = [
-        ("SimpleQueryEncoder", query_encoder),
-        ("TrainableAdapter", adapter),
-        ("TrainableScorer", scorer),
-    ]
-    
-    print("\nParameter counts:")
-    total_all = 0
-    trainable_all = 0
-    
-    for name, module in modules_to_count:
-        total, trainable = count_parameters(module, name)
-        total_all += total
-        trainable_all += trainable
-        print(f"  {name:30s} - Total: {total:>8,} | Trainable: {trainable:>8,}")
-    
-    print(f"  {'TOTAL':30s} - Total: {total_all:>8,} | Trainable: {trainable_all:>8,}")
-    
-    print(f"\nTrainable modules:")
-    trainable_modules = []
-    for name, module in modules_to_count:
-        if any(p.requires_grad for p in module.parameters()):
-            trainable_modules.append(name)
-            print(f"  ✓ {name}")
-    
-    print(f"\nFrozen modules:")
-    for name, module in modules_to_count:
-        if not any(p.requires_grad for p in module.parameters()):
-            print(f"  ❄ {name}")
-    
-    
-    # =============================================================================
-    # TASK 5: GROUNDING TRAINING LOOP
-    # =============================================================================
-    
-    print("\n" + "-" * 50)
-    print("TASK 5: Preparing training loop")
-    print("-" * 50)
-    
-    # Dataset and dataloader
-    dataset = CachedFeatureDataset(
-        cache_dir=cache_dir,
-        coco_json_path=coco_json,
-        max_samples=max_steps_per_epoch * num_epochs,
-    )
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
-    
-    print(f"✓ DataLoader ready ({len(dataset)} samples)")
-    
-    # Optimizer (only trainable parameters)
-    trainable_params = []
-    for module in [adapter, scorer]:
-        trainable_params.extend([p for p in module.parameters() if p.requires_grad])
-    
-    optimizer = torch.optim.Adam(trainable_params, lr=learning_rate)
-    print(f"✓ Optimizer initialized (Adam, lr={learning_rate})")
-    
-    
-    # =============================================================================
-    # TASK 6 & 7: TRAINING WITH LOGGING
-    # =============================================================================
-    
-    print("\n" + "-" * 50)
-    print("TASK 6-7: Running grounding training with logging")
-    print("-" * 50)
-    
-    # Logging storage
-    training_log = {
-        "losses": [],
-        "positive_scores": [],
-        "max_negative_scores": [],
-        "margins": [],
-        "rejection_losses": [],
-    }
-    
-    # Moving averages for early stopping
-    moving_avg_window = 20
-    positive_margin_streak = 0
-    early_stop_threshold = 20
-    early_stopped = False
-    
-    step_counter = 0
-    start_time = time.time()
-    
-    for epoch in range(num_epochs):
-        if early_stopped:
-            break
-            
-        print(f"\n{'='*70}")
-        print(f"EPOCH {epoch + 1}/{num_epochs}")
-        print(f"{'='*70}")
-        
-        epoch_losses = []
-        
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
-            if step_counter >= max_steps_per_epoch * num_epochs:
-                break
-            
-            # Extract batch data (batch_size=1) and move to device
-            visual_embeddings = batch["visual_embeddings"][0].to(device)  # [N, 256]
-            boxes = batch["boxes"][0].to(device)  # [N, 4]
-            masks = batch["masks"][0].to(device)  # [N, 160, 160]
-            keypoints = batch["keypoints"][0].to(device)  # [N, 17, 3]
-            valid = batch["valid"][0].to(device)  # [N]
-            caption = batch["caption"][0]
-            gt_index = batch["gt_index"][0].item()
-            
-            N = boxes.shape[0]
-            
-            # Skip if no humans
-            if N == 0:
-                continue
-            
-            # DEVICE ASSERTION: All input tensors must be on expected device
-            input_tensors = [visual_embeddings, boxes, masks, keypoints, valid]
-            for t in input_tensors:
-                assert str(t.device).startswith(device.split(':')[0]), \
-                    f"Input tensor device mismatch: {t.device} vs expected {device}"
-            
-            # Ensure gt_index is valid
-            if gt_index >= N:
-                gt_index = N - 1
-            
-            # =====================================================================
-            # FORWARD PASS
-            # =====================================================================
-            
-            # 1. Encode query
-            with torch.no_grad():
-                query_embedding = query_encoder(caption)  # [D_QUERY]
-            
-            # DEVICE ASSERTION: Query must be on same device
-            assert str(query_embedding.device).startswith(device.split(':')[0]), \
-                f"Query embedding device mismatch: {query_embedding.device} vs expected {device}"
-            
-            # 2. Use cached visual embeddings as tokens directly
-            # visual_embeddings are already [N, 256] from cache
-            tokens = visual_embeddings  # [N, D_TOKEN=256]
-            
-            # 3. Apply grounding adapter
-            grounded_tokens = adapter(tokens, query_embedding)  # [N, D_TOKEN]
-            
-            # 4. Score humans
-            scores = scorer(grounded_tokens, query_embedding)  # [N]
-            
-            # =====================================================================
-            # COMPUTE LOSS
-            # =====================================================================
-            
-            # Create GT labels
-            labels = torch.zeros(N, dtype=torch.long, device=device)
-            labels[gt_index] = 1  # 1 = positive, 0 = negative
-            
-            # MIRL loss
-            loss_dict = mirl_loss_fn(scores, labels, valid)
-            total_loss = loss_dict["total"]
-            
-            # =====================================================================
-            # BACKWARD & OPTIMIZE
-            # =====================================================================
-            
-            optimizer.zero_grad()
-            total_loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            
-            optimizer.step()
-            
-            # =====================================================================
-            # LOGGING
-            # =====================================================================
-            
-            positive_score = scores[gt_index].item()
-            
-            # Get negative scores
-            negative_mask = labels == 0
-            if negative_mask.any():
-                negative_scores = scores[negative_mask]
-                max_negative_score = negative_scores.max().item()
-                margin = positive_score - max_negative_score
-            else:
-                max_negative_score = float('-inf')
-                margin = float('inf')
-            
-            rejection_loss = loss_dict.get("rejection", torch.tensor(0.0)).item()
-            
-            training_log["losses"].append(total_loss.item())
-            training_log["positive_scores"].append(positive_score)
-            training_log["max_negative_scores"].append(max_negative_score)
-            training_log["margins"].append(margin)
-            training_log["rejection_losses"].append(rejection_loss)
-            
-            epoch_losses.append(total_loss.item())
-            
-            # Compute moving averages
-            if len(training_log["losses"]) >= moving_avg_window:
-                recent_losses = training_log["losses"][-moving_avg_window:]
-                recent_margins = training_log["margins"][-moving_avg_window:]
-                avg_loss_ma = sum(recent_losses) / len(recent_losses)
-                avg_margin_ma = sum(recent_margins) / len(recent_margins)
-            else:
-                avg_loss_ma = total_loss.item()
-                avg_margin_ma = margin
-            
-            # Print every 20 steps (more frequent for laptop)
-            if step_counter % 20 == 0 or step_counter < 5:
-                print(f"\nStep {step_counter}:")
-                print(f"  Loss:              {total_loss.item():.4f}")
-                print(f"  GT score:          {positive_score:.4f}")
-                print(f"  Max neg score:     {max_negative_score:.4f}")
-                print(f"  Margin:            {margin:+.4f}")
-                if len(training_log["losses"]) >= moving_avg_window:
-                    print(f"  MA Loss (20):      {avg_loss_ma:.4f}")
-                    print(f"  MA Margin (20):    {avg_margin_ma:+.4f}")
-            
-            # Early stopping check: margin > 0 for N consecutive steps
-            if margin > 0:
-                positive_margin_streak += 1
-            else:
-                positive_margin_streak = 0
-            
-            # Check early stop conditions
-            if positive_margin_streak >= early_stop_threshold and len(training_log["losses"]) >= 30:
-                # Also check loss is not exploding
-                recent_losses = training_log["losses"][-20:]
-                max_recent = max(recent_losses)
-                if max_recent < 1.0:  # Loss bounded
-                    print(f"\n" + "="*70)
-                    print("EARLY STOP: Grounding behavior verified!")
-                    print(f"  Positive margin streak: {positive_margin_streak} steps")
-                    print(f"  Recent max loss: {max_recent:.4f}")
-                    print("="*70)
-                    early_stopped = True
-                    break
-            
-            step_counter += 1
-        
-        # Epoch summary
-        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0
-        print(f"\nEpoch {epoch + 1} summary:")
-        print(f"  Average loss: {avg_loss:.4f}")
-        print(f"  Steps completed: {len(epoch_losses)}")
-        
-        # Save checkpoint after each epoch
-        checkpoint_path = checkpoint_dir / f"epoch_{epoch + 1}.pt"
-        torch.save({
-            "epoch": epoch + 1,
-            "adapter": adapter.state_dict(),
-            "scorer": scorer.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "step_counter": step_counter,
-            "training_log": training_log,
-        }, checkpoint_path)
-        print(f"  Checkpoint saved: {checkpoint_path}")
-    
-    elapsed = time.time() - start_time
-    print(f"\n{'='*70}")
-    print(f"TRAINING COMPLETED")
-    print(f"{'='*70}")
-    print(f"Total time: {elapsed:.1f} seconds ({elapsed/step_counter:.2f}s/step)")
-    
-    
-    # =============================================================================
-    # TASK 8: FINAL VERDICT
-    # =============================================================================
-    
-    print("\n" + "-" * 50)
-    print("TASK 8: Expected Behavior Check & Final Verdict")
-    print("-" * 50)
-    
-    # Check 1: Loss decreases over time
-    first_5_losses = training_log["losses"][:5]
-    last_5_losses = training_log["losses"][-5:]
-    
-    print(f"\nFirst 5 loss values: {[f'{l:.4f}' for l in first_5_losses]}")
-    print(f"Last 5 loss values:  {[f'{l:.4f}' for l in last_5_losses]}")
-    
-    avg_first_5 = sum(first_5_losses) / len(first_5_losses)
-    avg_last_5 = sum(last_5_losses) / len(last_5_losses)
-    loss_decreased = avg_last_5 < avg_first_5
-    
-    print(f"\nAverage first 5: {avg_first_5:.4f}")
-    print(f"Average last 5:  {avg_last_5:.4f}")
-    print(f"Loss decreased: {'✓' if loss_decreased else '✗'}")
-    
-    # Check 2: Mean GT score increases
-    first_10_gt_scores = training_log["positive_scores"][:10]
-    last_10_gt_scores = training_log["positive_scores"][-10:]
-    
-    avg_first_gt = sum(first_10_gt_scores) / len(first_10_gt_scores)
-    avg_last_gt = sum(last_10_gt_scores) / len(last_10_gt_scores)
-    gt_score_increased = avg_last_gt > avg_first_gt
-    
-    print(f"\nGT score progression:")
-    print(f"  Average first 10 GT scores: {avg_first_gt:.4f}")
-    print(f"  Average last 10 GT scores:  {avg_last_gt:.4f}")
-    print(f"  GT score increased: {'✓' if gt_score_increased else '✗'}")
-    
-    # Check 3: GT > negatives in majority of steps
-    positive_margins = [m for m in training_log["margins"] if m > 0]
-    margin_success_rate = len(positive_margins) / len(training_log["margins"])
-    
-    print(f"\nMargin analysis:")
-    print(f"  Steps with positive margin: {len(positive_margins)} / {len(training_log['margins'])}")
-    print(f"  Success rate: {margin_success_rate*100:.1f}%")
-    print(f"  Majority GT > negatives: {'✓' if margin_success_rate > 0.5 else '✗'}")
-    
-    # Sample margins
-    print(f"\nSample margins (first 10):")
-    for i in range(min(10, len(training_log["margins"]))):
-        m = training_log["margins"][i]
-        print(f"  Step {i}: {m:+.4f}")
-    
-    # Check 4: No NaN/Inf
-    has_nan_inf = any(
-        not (torch.isfinite(torch.tensor(l)) if isinstance(l, (int, float)) else True)
-        for l in training_log["losses"]
-    )
-    print(f"\nNo NaN/Inf in losses: {'✓' if not has_nan_inf else '✗'}")
-    
-    # Final verdict
-    print(f"\n{'='*70}")
-    print("FINAL VERDICT")
-    print("="*70)
-    
-    checks_passed = [
-        loss_decreased,
-        gt_score_increased,
-        margin_success_rate > 0.5,
-        not has_nan_inf,
-    ]
-    
-    all_passed = all(checks_passed)
-    
-    # Print last 5 margins
-    print(f"\nLast 5 margins:")
-    for i, m in enumerate(training_log["margins"][-5:]):
-        idx = len(training_log["margins"]) - 5 + i
-        print(f"  Step {idx}: {m:+.4f}")
-    
-    print(f"\nSteps completed: {step_counter}")
-    print(f"Early stopped: {'YES' if early_stopped else 'NO'}")
-    
-    if all_passed or early_stopped:
-        print("\n✅ GROUNDING TRAINING PASSED")
-        print("\nAll checks passed:")
-        if loss_decreased:
-            print("  ✓ Loss decreased over training")
-        if gt_score_increased:
-            print("  ✓ GT scores increased")
-        if margin_success_rate > 0.5:
-            print("  ✓ GT > negatives in majority of steps")
-        if not has_nan_inf:
-            print("  ✓ No NaN/Inf detected")
-        if early_stopped:
-            print("  ✓ Early stop triggered (behavior verified)")
-        print("\nGrounding components learned successfully from cached features!")
-        print("Ready for full training pipeline.")
-    else:
-        print("\n❌ GROUNDING TRAINING FAILED")
-        print("\nFailed checks:")
-        if not loss_decreased:
-            print("  ✗ Loss did not decrease")
-        if not gt_score_increased:
-            print("  ✗ GT scores did not increase")
-        if not margin_success_rate > 0.5:
-            print("  ✗ GT not consistently scored higher than negatives")
-        if has_nan_inf:
-            print("  ✗ NaN/Inf detected in losses")
-        print("\nReview training logs above for debugging.")
-    
-    print(f"\n{'='*70}\n")
-
-
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
-
 if __name__ == "__main__":
     import argparse
     from core.config import load_config, add_config_argument
     
-    parser = argparse.ArgumentParser(description="Train grounding components with cached YOLO features")
+    parser = argparse.ArgumentParser(description="Train grounding with cached YOLO features")
     add_config_argument(parser)
     args = parser.parse_args()
     
     config = load_config(args.config)
     train_grounding(config)
+
+# This is the updated one!!!
