@@ -1,0 +1,71 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.env
+.venv
+venv/
+env/
+
+# -------------------------
+# IDE / OS
+# -------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Logs & checkpoints
+# -------------------------
+logs/
+*.log
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# -------------------------
+# Cached features (REGENERABLE)
+# -------------------------
+cache/
+feature_cache/
+yolo_cache/
+
+# -------------------------
+# Large datasets / images
+# -------------------------
+images/
+images_200/
+datasets/
+data/raw/
+data/processed/
+
+# -------------------------
+# COCO JSON (too large)
+# -------------------------
+*_annotations*.json
+*.jsonl
+
+# -------------------------
+# Training outputs
+# -------------------------
+runs/
+outputs/
+results/
+
+# -------------------------
+# Temporary / debug
+# -------------------------
+debug/
+tmp/
