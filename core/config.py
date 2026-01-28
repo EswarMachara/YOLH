@@ -94,6 +94,22 @@ class SplitsConfig:
 
 
 @dataclass
+class YOLOConfig:
+    """YOLO fine-tuning configuration."""
+    pose_model: str = "yolo11l-pose.pt"
+    seg_model: str = "yolo11l-seg.pt"
+    fine_tune: bool = True
+    epochs: int = 50
+    batch_size: int = 16
+    img_size: int = 640
+    learning_rate: float = 0.001
+    weight_decay: float = 0.0005
+    output_dir: str = "checkpoints/yolo_finetuned"
+    pose_finetuned: str = "checkpoints/yolo_finetuned/pose_best.pt"
+    seg_finetuned: str = "checkpoints/yolo_finetuned/seg_best.pt"
+
+
+@dataclass
 class Config:
     """
     Main configuration container.
@@ -107,6 +123,7 @@ class Config:
     checkpoints: CheckpointsConfig
     runtime: RuntimeConfig
     splits: SplitsConfig = field(default_factory=SplitsConfig)
+    yolo: YOLOConfig = field(default_factory=YOLOConfig)
     
     # Project root for resolving relative paths
     project_root: Path = field(default_factory=lambda: Path.cwd())
@@ -144,6 +161,35 @@ class Config:
     def checkpoint_dir(self) -> Path:
         """Absolute path to checkpoint directory."""
         return self.resolve_path(self.checkpoints.save_dir)
+    
+    @property
+    def yolo_output_dir(self) -> Path:
+        """Absolute path to YOLO fine-tuned output directory."""
+        return self.resolve_path(self.yolo.output_dir)
+    
+    @property
+    def yolo_pose_model_path(self) -> Path:
+        """Absolute path to YOLO pose model (base or fine-tuned)."""
+        if self.yolo.fine_tune:
+            return self.resolve_path(self.yolo.pose_finetuned)
+        return self.resolve_path(self.yolo.pose_model)
+    
+    @property
+    def yolo_seg_model_path(self) -> Path:
+        """Absolute path to YOLO seg model (base or fine-tuned)."""
+        if self.yolo.fine_tune:
+            return self.resolve_path(self.yolo.seg_finetuned)
+        return self.resolve_path(self.yolo.seg_model)
+    
+    @property
+    def yolo_pose_base_path(self) -> Path:
+        """Absolute path to YOLO pose BASE model (for fine-tuning)."""
+        return self.resolve_path(self.yolo.pose_model)
+    
+    @property
+    def yolo_seg_base_path(self) -> Path:
+        """Absolute path to YOLO seg BASE model (for fine-tuning)."""
+        return self.resolve_path(self.yolo.seg_model)
 
 
 # =============================================================================
@@ -240,6 +286,12 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
     else:
         splits_config = SplitsConfig()  # Use defaults
     
+    # Handle optional yolo section (with defaults)
+    if "yolo" in raw and raw["yolo"] is not None:
+        yolo_config = YOLOConfig(**raw["yolo"])
+    else:
+        yolo_config = YOLOConfig()  # Use defaults
+    
     # Build typed config
     config = Config(
         dataset=DatasetConfig(**raw["dataset"]),
@@ -249,6 +301,7 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
         checkpoints=CheckpointsConfig(**raw["checkpoints"]),
         runtime=RuntimeConfig(**raw["runtime"]),
         splits=splits_config,
+        yolo=yolo_config,
         project_root=project_root,
     )
     

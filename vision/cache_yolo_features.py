@@ -348,10 +348,39 @@ def cache_yolo_features(config: Config):
     print("STEP 1: Initializing frozen YOLO models")
     print("-" * 50)
     
-    model_pose_path = config.pose_model_path
-    model_seg_path = config.seg_model_path
+    # Determine which weights to use based on fine_tune config
+    if config.yolo.fine_tune:
+        # Use fine-tuned weights
+        model_pose_path = config.yolo_pose_model_path
+        model_seg_path = config.yolo_seg_model_path
+        
+        # SAFETY CHECK: Ensure fine-tuned weights exist
+        if not model_pose_path.exists():
+            raise RuntimeError(
+                f"Fine-tuned pose weights not found: {model_pose_path}\n"
+                f"Please run YOLO fine-tuning first:\n"
+                f"  python training/yolo_finetune.py --config config/config.yaml"
+            )
+        if not model_seg_path.exists():
+            raise RuntimeError(
+                f"Fine-tuned seg weights not found: {model_seg_path}\n"
+                f"Please run YOLO fine-tuning first:\n"
+                f"  python training/yolo_finetune.py --config config/config.yaml"
+            )
+        
+        print(f"  *** USING FINE-TUNED YOLO WEIGHTS ***")
+        print(f"  Pose model: {model_pose_path}")
+        print(f"  Seg model: {model_seg_path}")
+    else:
+        # Use pretrained base weights
+        model_pose_path = config.pose_model_path
+        model_seg_path = config.seg_model_path
+        print(f"  Using pretrained YOLO weights:")
+        print(f"  Pose model: {model_pose_path}")
+        print(f"  Seg model: {model_seg_path}")
     
-    print(f"  Loading pose model: {model_pose_path}")
+    # Load pose model
+    print(f"\n  Loading pose model...")
     model_pose = YOLO(str(model_pose_path))
     model_pose.to(device)
     model_pose.model.eval()
@@ -360,7 +389,8 @@ def cache_yolo_features(config: Config):
     for param in model_pose.model.parameters():
         param.requires_grad = False
     
-    print(f"  Loading seg model: {model_seg_path}")
+    # Load seg model
+    print(f"  Loading seg model...")
     model_seg = YOLO(str(model_seg_path))
     model_seg.to(device)
     model_seg.model.eval()
@@ -655,6 +685,41 @@ def cache_yolo_features(config: Config):
         print("    ✓ CACHING COMPLETE - READY FOR TRAINING")
     else:
         print("    ⚠ CACHING COMPLETE WITH WARNINGS - REVIEW ERRORS ABOVE")
+    
+    # ==========================================================================
+    # STEP 8: Save cache metadata for consistency validation
+    # ==========================================================================
+    import json
+    from datetime import datetime
+    
+    metadata = {
+        "created_at": datetime.now().isoformat(),
+        "yolo_fine_tuned": config.yolo.fine_tune,
+        "pose_model": str(model_pose_path),
+        "seg_model": str(model_seg_path),
+        "stats": {
+            "processed": stats['processed'],
+            "total_images": stats['total_images'],
+            "images_with_humans": stats['images_with_humans'],
+            "total_humans": stats['total_humans'],
+            "failed": stats['failed'],
+            "nan_inf_count": stats['nan_inf_count'],
+        },
+        "cache_size_mb": round(total_size, 2),
+        "config": {
+            "pose_base": config.yolo.pose_model,
+            "seg_base": config.yolo.seg_model,
+            "pose_finetuned": config.yolo.pose_finetuned,
+            "seg_finetuned": config.yolo.seg_finetuned,
+        }
+    }
+    
+    metadata_path = cache_dir / "cache_metadata.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"\n    Metadata saved to: {metadata_path}")
+    print(f"    YOLO weights used: {'FINE-TUNED' if config.yolo.fine_tune else 'PRETRAINED'}")
 
 
 if __name__ == "__main__":

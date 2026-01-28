@@ -14,8 +14,32 @@ cache:
 
 models:
   # YOLO model paths (relative to project root)
+  # These are the BASE models (pretrained) - used if yolo.fine_tune is false
   pose_model: yolo11n-pose.pt
   seg_model: yolo11n-seg.pt
+
+# =============================================================================
+# YOLO FINE-TUNING CONFIGURATION
+# =============================================================================
+# Fine-tune large YOLO models on the TRAIN split for improved detection.
+# After fine-tuning, feature caching will use the fine-tuned weights.
+yolo:
+  # Large model variants for fine-tuning
+  pose_model: yolo11l-pose.pt
+  seg_model: yolo11l-seg.pt
+  # Enable fine-tuning mode
+  fine_tune: true
+  # Training hyperparameters
+  epochs: 50
+  batch_size: 16
+  img_size: 640
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  # Output directory for fine-tuned weights
+  output_dir: checkpoints/yolo_finetuned
+  # Paths to fine-tuned weights (used when fine_tune=true for caching/inference)
+  pose_finetuned: checkpoints/yolo_finetuned/pose_best.pt
+  seg_finetuned: checkpoints/yolo_finetuned/seg_best.pt
 
 training:
   # Device: "cuda" for GPU, "cpu" for CPU-only

@@ -1255,6 +1255,32 @@ def train_grounding(config: "Config"):
         print(f"\n❌ ABORT: No cached .pt files found in {cache_dir}")
         sys.exit(1)
     
+    # Validate cache metadata - ensure cache was built with expected YOLO weights
+    metadata_path = cache_dir / "cache_metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            cache_meta = json.load(f)
+        
+        cached_finetuned = cache_meta.get("yolo_fine_tuned", False)
+        config_finetuned = config.yolo.fine_tune
+        
+        if cached_finetuned != config_finetuned:
+            print(f"\n❌ ABORT: YOLO weight mismatch!")
+            print(f"  Cache was built with: {'FINE-TUNED' if cached_finetuned else 'PRETRAINED'} weights")
+            print(f"  Config expects:       {'FINE-TUNED' if config_finetuned else 'PRETRAINED'} weights")
+            print(f"\n  To fix: Re-run cache_yolo_features.py with matching config")
+            sys.exit(1)
+        
+        print(f"\n✓ Cache metadata validated:")
+        print(f"  Created: {cache_meta.get('created_at', 'unknown')}")
+        print(f"  YOLO weights: {'FINE-TUNED' if cached_finetuned else 'PRETRAINED'}")
+        print(f"  Pose model: {cache_meta.get('pose_model', 'unknown')}")
+        print(f"  Seg model: {cache_meta.get('seg_model', 'unknown')}")
+    else:
+        print(f"\n⚠ WARNING: No cache metadata found at {metadata_path}")
+        print(f"  Cannot verify YOLO weights consistency")
+        print(f"  Consider re-running cache_yolo_features.py to generate metadata")
+    
     print(f"\nCache found: YES")
     print(f"Cached images: {len(cache_files)}")
     
