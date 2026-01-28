@@ -9,8 +9,10 @@ CONSTRAINTS:
 - ✅ CUDA only (no CPU fallback)
 - ✅ Uses sample-level splits (converted to image-level for YOLO)
 - ✅ Saves best checkpoints to config-specified directory
+- ✅ CSV logging of per-epoch metrics
 - ❌ No grounding logic
 - ❌ No frozen models
+- ❌ No TEST split usage (Train on TRAIN, validate on VAL only)
 
 OUTPUT:
     checkpoints/yolo_finetuned/
@@ -20,6 +22,10 @@ OUTPUT:
             ├── images/
             ├── labels_pose/
             └── labels_seg/
+    
+    outputs/logs/
+        ├── yolo_pose_metrics.csv
+        └── yolo_seg_metrics.csv
 
 USAGE:
     python training/yolo_finetune.py --config config/config.yaml
@@ -28,8 +34,10 @@ USAGE:
 import sys
 import argparse
 import shutil
+import csv
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, Optional
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -76,6 +84,75 @@ def download_model_if_needed(model_name: str, model_path: Path) -> Path:
         return Path(model_name)
     except Exception as e:
         raise RuntimeError(f"Failed to download {model_name}: {e}")
+
+
+def parse_yolo_results(results_dir: Path) -> Dict[str, Any]:
+    """
+    Parse YOLO training results from CSV.
+    
+    Args:
+        results_dir: Path to YOLO run directory
+        
+    Returns:
+        Dict with per-epoch metrics
+    """
+    results_csv = results_dir / "results.csv"
+    if not results_csv.exists():
+        return {}
+    
+    epochs_data = []
+    with open(results_csv, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Clean up column names (YOLO adds spaces)
+            cleaned = {k.strip(): v.strip() if isinstance(v, str) else v for k, v in row.items()}
+            epochs_data.append(cleaned)
+    
+    return epochs_data
+
+
+def save_yolo_metrics_csv(
+    epochs_data: list,
+    output_path: Path,
+    model_type: str,  # 'pose' or 'seg'
+):
+    """
+    Save YOLO training metrics to standardized CSV.
+    
+    Args:
+        epochs_data: List of epoch dictionaries from YOLO results
+        output_path: Path to save CSV
+        model_type: 'pose' or 'seg'
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    columns = [
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "mAP50_box",
+        "mAP50_mask",
+        "OKS_pose",
+        "timestamp",
+    ]
+    
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        
+        for i, data in enumerate(epochs_data):
+            row = {
+                "epoch": i + 1,
+                "train_loss": data.get("train/box_loss", data.get("train/cls_loss", "")),
+                "val_loss": data.get("val/box_loss", data.get("val/cls_loss", "")),
+                "mAP50_box": data.get("metrics/mAP50(B)", ""),
+                "mAP50_mask": data.get("metrics/mAP50(M)", "") if model_type == "seg" else "",
+                "OKS_pose": data.get("metrics/mAP50(P)", "") if model_type == "pose" else "",
+                "timestamp": datetime.now().isoformat(),
+            }
+            writer.writerow(row)
+    
+    print(f"✓ Saved {model_type} metrics to: {output_path}")
 
 
 def train_pose_model(
@@ -125,6 +202,23 @@ def train_pose_model(
         workers=4,
         seed=config.runtime.seed,
     )
+    
+    # Parse and save metrics to CSV
+    run_dir = output_dir / 'runs' / 'pose'
+    epochs_data = parse_yolo_results(run_dir)
+    if epochs_data:
+        csv_path = config.logs_dir / "yolo_pose_metrics.csv"
+        save_yolo_metrics_csv(epochs_data, csv_path, "pose")
+        
+        # Print per-epoch summary
+        print("\n  Per-epoch metrics (pose):")
+        print(f"  {'Epoch':>6} {'Train Loss':>12} {'Val Loss':>12} {'mAP50(P)':>12}")
+        print("  " + "-" * 48)
+        for i, data in enumerate(epochs_data[-5:], start=max(1, len(epochs_data)-4)):
+            tl = data.get("train/box_loss", "N/A")
+            vl = data.get("val/box_loss", "N/A")
+            mp = data.get("metrics/mAP50(P)", "N/A")
+            print(f"  {i:>6} {str(tl):>12} {str(vl):>12} {str(mp):>12}")
     
     # Copy best weights to standard location
     best_weights = output_dir / 'runs' / 'pose' / 'weights' / 'best.pt'
@@ -192,6 +286,24 @@ def train_seg_model(
         workers=4,
         seed=config.runtime.seed,
     )
+    
+    # Parse and save metrics to CSV
+    run_dir = output_dir / 'runs' / 'seg'
+    epochs_data = parse_yolo_results(run_dir)
+    if epochs_data:
+        csv_path = config.logs_dir / "yolo_seg_metrics.csv"
+        save_yolo_metrics_csv(epochs_data, csv_path, "seg")
+        
+        # Print per-epoch summary
+        print("\n  Per-epoch metrics (seg):")
+        print(f"  {'Epoch':>6} {'Train Loss':>12} {'Val Loss':>12} {'mAP50(B)':>12} {'mAP50(M)':>12}")
+        print("  " + "-" * 60)
+        for i, data in enumerate(epochs_data[-5:], start=max(1, len(epochs_data)-4)):
+            tl = data.get("train/box_loss", "N/A")
+            vl = data.get("val/box_loss", "N/A")
+            mb = data.get("metrics/mAP50(B)", "N/A")
+            mm = data.get("metrics/mAP50(M)", "N/A")
+            print(f"  {i:>6} {str(tl):>12} {str(vl):>12} {str(mb):>12} {str(mm):>12}")
     
     # Copy best weights to standard location
     best_weights = output_dir / 'runs' / 'seg' / 'weights' / 'best.pt'

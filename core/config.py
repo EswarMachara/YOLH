@@ -110,6 +110,16 @@ class YOLOConfig:
 
 
 @dataclass
+class OutputsConfig:
+    """Output directories configuration."""
+    base_dir: str = "outputs"
+    logs_dir: str = "outputs/logs"
+    visualizations_dir: str = "outputs/visualizations"
+    plots_dir: str = "outputs/plots"
+    evaluation_dir: str = "outputs/evaluation"
+
+
+@dataclass
 class Config:
     """
     Main configuration container.
@@ -124,6 +134,7 @@ class Config:
     runtime: RuntimeConfig
     splits: SplitsConfig = field(default_factory=SplitsConfig)
     yolo: YOLOConfig = field(default_factory=YOLOConfig)
+    outputs: OutputsConfig = field(default_factory=OutputsConfig)
     
     # Project root for resolving relative paths
     project_root: Path = field(default_factory=lambda: Path.cwd())
@@ -190,6 +201,26 @@ class Config:
     def yolo_seg_base_path(self) -> Path:
         """Absolute path to YOLO seg BASE model (for fine-tuning)."""
         return self.resolve_path(self.yolo.seg_model)
+    
+    @property
+    def logs_dir(self) -> Path:
+        """Absolute path to logs directory."""
+        return self.resolve_path(self.outputs.logs_dir)
+    
+    @property
+    def visualizations_dir(self) -> Path:
+        """Absolute path to visualizations directory."""
+        return self.resolve_path(self.outputs.visualizations_dir)
+    
+    @property
+    def plots_dir(self) -> Path:
+        """Absolute path to plots directory."""
+        return self.resolve_path(self.outputs.plots_dir)
+    
+    @property
+    def evaluation_dir(self) -> Path:
+        """Absolute path to evaluation directory."""
+        return self.resolve_path(self.outputs.evaluation_dir)
 
 
 # =============================================================================
@@ -292,6 +323,12 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
     else:
         yolo_config = YOLOConfig()  # Use defaults
     
+    # Handle optional outputs section (with defaults)
+    if "outputs" in raw and raw["outputs"] is not None:
+        outputs_config = OutputsConfig(**raw["outputs"])
+    else:
+        outputs_config = OutputsConfig()  # Use defaults
+    
     # Build typed config
     config = Config(
         dataset=DatasetConfig(**raw["dataset"]),
@@ -302,6 +339,7 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
         runtime=RuntimeConfig(**raw["runtime"]),
         splits=splits_config,
         yolo=yolo_config,
+        outputs=outputs_config,
         project_root=project_root,
     )
     

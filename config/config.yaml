@@ -88,3 +88,18 @@ splits:
   test: 0.1
   # Seed for deterministic shuffling (separate from runtime seed)
   seed: 42
+
+# =============================================================================
+# OUTPUTS CONFIGURATION
+# =============================================================================
+outputs:
+  # Base output directory for all artifacts
+  base_dir: outputs
+  # Directory for CSV logs
+  logs_dir: outputs/logs
+  # Directory for visualizations
+  visualizations_dir: outputs/visualizations
+  # Directory for plots
+  plots_dir: outputs/plots
+  # Directory for evaluation results
+  evaluation_dir: outputs/evaluation
