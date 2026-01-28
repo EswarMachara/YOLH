@@ -22,6 +22,7 @@ checkpoints/
 data/images/
 data/images_200/
 data/annotations*.json
+*.json 
 
 # Python
 __pycache__/
