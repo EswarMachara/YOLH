@@ -8,6 +8,12 @@ Implements:
 - Image-level caption deduplication
 - Global caption frequency cap
 - Deterministic negative sampling
+- SAMPLE-LEVEL train/val/test splits (NOT image-level)
+
+A SAMPLE is defined as: (image_id, caption, gt_human_index, candidate_humans)
+Splitting happens at sample level, meaning the same image may appear in 
+multiple splits with different captions/instances. This is INTENTIONAL and 
+CORRECT for referring expression grounding tasks.
 
 Output format per sample:
 {
@@ -21,13 +27,15 @@ Output format per sample:
 }
 """
 
+import hashlib
 import json
+import random
 import re
 import string
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Literal
 
 import torch
 from torch.utils.data import Dataset
@@ -55,6 +63,36 @@ class CurationConfig:
             f"  min_bbox_area_ratio={self.min_bbox_area_ratio},\n"
             f"  max_occurrences_per_caption={self.max_occurrences_per_caption},\n"
             f"  max_negatives_per_sample={self.max_negatives_per_sample}\n"
+            f")"
+        )
+
+
+@dataclass
+class SplitConfig:
+    """Configuration for sample-level train/val/test splits."""
+    train: float = 0.8
+    val: float = 0.1
+    test: float = 0.1
+    seed: int = 42
+    
+    def __post_init__(self):
+        """Validate that ratios sum to exactly 1.0."""
+        total = self.train + self.val + self.test
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"Split ratios must sum to 1.0, got {total:.4f} "
+                f"(train={self.train}, val={self.val}, test={self.test})"
+            )
+        if any(r < 0 for r in [self.train, self.val, self.test]):
+            raise ValueError("Split ratios cannot be negative")
+    
+    def __repr__(self):
+        return (
+            f"SplitConfig(\n"
+            f"  train={self.train:.2f},\n"
+            f"  val={self.val:.2f},\n"
+            f"  test={self.test:.2f},\n"
+            f"  seed={self.seed}\n"
             f")"
         )
 
@@ -123,6 +161,42 @@ def normalize_caption(caption: str) -> str:
     text = text.strip()
     
     return text
+
+
+def compute_caption_hash(caption: str) -> str:
+    """
+    Compute a deterministic hash for a caption.
+    
+    Uses normalized caption to ensure consistency.
+    
+    Args:
+        caption: Raw or normalized caption
+        
+    Returns:
+        8-character hex hash
+    """
+    normalized = normalize_caption(caption)
+    return hashlib.md5(normalized.encode('utf-8')).hexdigest()[:8]
+
+
+def compute_sample_id(image_id: int, annotation_id: int, caption: str) -> str:
+    """
+    Compute a unique, deterministic sample identity.
+    
+    Used ONLY for:
+    1. Sample-level splitting
+    2. Leakage detection
+    
+    Args:
+        image_id: COCO image ID
+        annotation_id: COCO annotation ID
+        caption: Original caption string
+        
+    Returns:
+        Unique sample ID string: "imgID_annID_capHash"
+    """
+    cap_hash = compute_caption_hash(caption)
+    return f"{image_id}_{annotation_id}_{cap_hash}"
 
 
 # =============================================================================
@@ -261,6 +335,10 @@ def deduplicate_captions_in_image(
 # CURATED COCO DATASET CLASS
 # =============================================================================
 
+# Module-level cache for curated samples (shared across splits)
+_CURATED_SAMPLES_CACHE: Dict[str, Tuple[List, Dict, Dict, Dict]] = {}
+
+
 class CuratedCocoDataset(Dataset):
     """
     Curated COCO Dataset for RefYOLO-Human training.
@@ -270,11 +348,18 @@ class CuratedCocoDataset(Dataset):
     - Image-level caption deduplication
     - Global caption frequency cap
     - Deterministic negative sampling
+    - SAMPLE-LEVEL train/val/test splitting
+    
+    IMPORTANT: Splitting is at SAMPLE (caption-instance) level, NOT image level.
+    The same image may appear in multiple splits with different captions.
+    This is intentional and correct for referring expression grounding.
     
     Args:
         json_path: Path to COCO format JSON file
         image_dir: Directory containing images
+        split: Which split to load ("train", "val", "test", or None for all)
         config: CurationConfig with thresholds
+        split_config: SplitConfig with train/val/test ratios
         verbose: Print curation statistics
     """
     
@@ -282,13 +367,21 @@ class CuratedCocoDataset(Dataset):
         self,
         json_path: str,
         image_dir: str,
+        split: Optional[Literal["train", "val", "test"]] = None,
         config: Optional[CurationConfig] = None,
+        split_config: Optional[SplitConfig] = None,
         verbose: bool = True
     ):
         self.json_path = Path(json_path)
         self.image_dir = Path(image_dir)
+        self.split = split
         self.config = config or CurationConfig()
+        self.split_config = split_config or SplitConfig()
         self.verbose = verbose
+        
+        # Validate split parameter
+        if split is not None and split not in ("train", "val", "test"):
+            raise ValueError(f"split must be 'train', 'val', 'test', or None, got '{split}'")
         
         # Statistics tracking
         self.stats = {
@@ -302,9 +395,36 @@ class CuratedCocoDataset(Dataset):
             'final_instances': 0,
         }
         
-        # Load and curate
-        self._load_coco_json()
-        self._curate_dataset()
+        # Use cache key for sharing curated samples across splits
+        cache_key = str(self.json_path.resolve())
+        
+        if cache_key in _CURATED_SAMPLES_CACHE:
+            # Reuse cached curated samples
+            if self.verbose:
+                print(f"[CACHE HIT] Reusing curated samples for split='{split}'")
+            self._all_samples, self.images, self.stats, self._split_indices = _CURATED_SAMPLES_CACHE[cache_key]
+        else:
+            # First load - curate and cache
+            if self.verbose:
+                print(f"[CACHE MISS] Curating dataset (will be cached for other splits)")
+            self._load_coco_json()
+            self._curate_dataset()
+            self._compute_splits()
+            
+            # Cache for other split instances
+            _CURATED_SAMPLES_CACHE[cache_key] = (
+                self._all_samples,
+                self.images,
+                self.stats,
+                self._split_indices
+            )
+        
+        # Filter samples by split
+        if self.split is None:
+            self.samples = self._all_samples
+        else:
+            indices = self._split_indices[self.split]
+            self.samples = [self._all_samples[i] for i in indices]
         
         if verbose:
             self._print_statistics()
@@ -371,9 +491,9 @@ class CuratedCocoDataset(Dataset):
         # Global caption counter for frequency cap
         caption_usage_count: Dict[str, int] = defaultdict(int)
         
-        # Final samples list
-        # Each sample: (image_id, caption, gt_ann, all_valid_anns)
-        self.samples: List[Tuple[int, str, Dict, List[Dict]]] = []
+        # Final samples list (stored in _all_samples for split filtering)
+        # Each sample: (image_id, caption, gt_ann, all_valid_anns, sample_id)
+        self._all_samples: List[Tuple[int, str, Dict, List[Dict], str]] = []
         
         for image_id, annotations in self.annotations_by_image.items():
             image_info = self.images.get(image_id)
@@ -431,20 +551,24 @@ class CuratedCocoDataset(Dataset):
                 # Increment counter
                 caption_usage_count[norm_cap] += 1
                 
-                # Add sample with original caption (not normalized)
+                # Compute stable sample ID for splitting
                 original_caption = best_ann.get('caption', '')
-                self.samples.append((
+                sample_id = compute_sample_id(image_id, best_ann['id'], original_caption)
+                
+                # Add sample with original caption (not normalized) and sample_id
+                self._all_samples.append((
                     image_id,
                     original_caption,
                     best_ann,
-                    valid_annotations  # All valid instances for negative sampling
+                    valid_annotations,  # All valid instances for negative sampling
+                    sample_id,
                 ))
         
-        self.stats['final_samples'] = len(self.samples)
+        self.stats['final_samples'] = len(self._all_samples)
         
         # Count unique instances in final samples
         seen_ann_ids = set()
-        for _, _, gt_ann, valid_anns in self.samples:
+        for _, _, gt_ann, valid_anns, _ in self._all_samples:
             seen_ann_ids.add(gt_ann['id'])
             for ann in valid_anns:
                 seen_ann_ids.add(ann['id'])
@@ -455,6 +579,118 @@ class CuratedCocoDataset(Dataset):
         
         if self.verbose:
             print(f"  Final samples: {self.stats['final_samples']:,}")
+    
+    # =========================================================================
+    # SAMPLE-LEVEL SPLITTING
+    # =========================================================================
+    
+    def _compute_splits(self):
+        """
+        Compute sample-level train/val/test splits.
+        
+        IMPORTANT: This splits at SAMPLE level, NOT image level.
+        The same image may appear in multiple splits with different captions.
+        This is intentional for referring expression grounding.
+        
+        Process:
+        1. Generate deterministic indices based on seed
+        2. Shuffle ONCE using the provided seed
+        3. Partition into train/val/test using exact ratios
+        4. Validate no leakage
+        """
+        if self.verbose:
+            print(f"Computing sample-level splits (seed={self.split_config.seed})...")
+        
+        n_total = len(self._all_samples)
+        if n_total == 0:
+            self._split_indices = {"train": [], "val": [], "test": []}
+            return
+        
+        # Generate indices and shuffle deterministically
+        indices = list(range(n_total))
+        rng = random.Random(self.split_config.seed)
+        rng.shuffle(indices)
+        
+        # Compute split boundaries
+        n_train = int(n_total * self.split_config.train)
+        n_val = int(n_total * self.split_config.val)
+        # Test gets the remainder to ensure no samples are lost
+        n_test = n_total - n_train - n_val
+        
+        # Partition
+        train_indices = indices[:n_train]
+        val_indices = indices[n_train:n_train + n_val]
+        test_indices = indices[n_train + n_val:]
+        
+        self._split_indices = {
+            "train": train_indices,
+            "val": val_indices,
+            "test": test_indices,
+        }
+        
+        # =====================================================================
+        # LEAKAGE VALIDATION (REQUIRED - HARD FAIL)
+        # =====================================================================
+        self._validate_no_leakage()
+        
+        # Update stats with split info
+        self.stats['train_samples'] = len(train_indices)
+        self.stats['val_samples'] = len(val_indices)
+        self.stats['test_samples'] = len(test_indices)
+    
+    def _validate_no_leakage(self):
+        """
+        Validate that no sample appears in multiple splits.
+        
+        Hard-fails if:
+        - Any sample ID appears in more than one split
+        - Total split counts don't match total samples
+        """
+        train_ids = set()
+        val_ids = set()
+        test_ids = set()
+        
+        for idx in self._split_indices["train"]:
+            sample_id = self._all_samples[idx][4]  # sample_id is 5th element
+            train_ids.add(sample_id)
+        
+        for idx in self._split_indices["val"]:
+            sample_id = self._all_samples[idx][4]
+            val_ids.add(sample_id)
+        
+        for idx in self._split_indices["test"]:
+            sample_id = self._all_samples[idx][4]
+            test_ids.add(sample_id)
+        
+        # Check for overlap
+        train_val_overlap = train_ids & val_ids
+        train_test_overlap = train_ids & test_ids
+        val_test_overlap = val_ids & test_ids
+        
+        if train_val_overlap:
+            raise RuntimeError(
+                f"[LEAKAGE DETECTED] {len(train_val_overlap)} samples in both train and val!"
+            )
+        if train_test_overlap:
+            raise RuntimeError(
+                f"[LEAKAGE DETECTED] {len(train_test_overlap)} samples in both train and test!"
+            )
+        if val_test_overlap:
+            raise RuntimeError(
+                f"[LEAKAGE DETECTED] {len(val_test_overlap)} samples in both val and test!"
+            )
+        
+        # Check total count
+        total_split = len(train_ids) + len(val_ids) + len(test_ids)
+        if total_split != len(self._all_samples):
+            raise RuntimeError(
+                f"[SPLIT ERROR] Total split samples ({total_split}) != "
+                f"total curated samples ({len(self._all_samples)})"
+            )
+        
+        if self.verbose:
+            print(f"  [PASS] No leakage detected")
+            print(f"  [PASS] len(train) + len(val) + len(test) == total_samples")
     
     # =========================================================================
     # TASK 7: NEGATIVE SAMPLING
@@ -516,8 +752,13 @@ class CuratedCocoDataset(Dataset):
                 "valid": Tensor[N],
                 "gt_index": int
             }
+            
+        NOTE: gt_index is always 0 (GT is first in list).
+              No additional fields are returned to preserve output contract.
         """
-        image_id, caption, gt_ann, all_valid_anns = self.samples[idx]
+        # Sample format: (image_id, caption, gt_ann, all_valid_anns, sample_id)
+        # sample_id is only used for splitting, not returned
+        image_id, caption, gt_ann, all_valid_anns, _sample_id = self.samples[idx]
         
         # Load image
         image_info = self.images[image_id]
@@ -569,7 +810,7 @@ class CuratedCocoDataset(Dataset):
     # =========================================================================
     
     def _print_statistics(self):
-        """Print curation statistics."""
+        """Print curation and split statistics."""
         print("\n" + "=" * 60)
         print("CURATION STATISTICS")
         print("=" * 60)
@@ -587,32 +828,68 @@ class CuratedCocoDataset(Dataset):
             self.stats['dropped_by_cap']
         )
         
-        print(f"    Dropped by language:      {self.stats['dropped_by_language']:,} "
-              f"({self.stats['dropped_by_language']/self.stats['total_annotations']*100:.1f}%)")
-        print(f"    Dropped by area filter:   {self.stats['dropped_by_area']:,} "
-              f"({self.stats['dropped_by_area']/self.stats['total_annotations']*100:.1f}%)")
-        print(f"    Dropped by deduplication: {self.stats['dropped_by_dedup']:,} "
-              f"({self.stats['dropped_by_dedup']/self.stats['total_annotations']*100:.1f}%)")
-        print(f"    Dropped by caption cap:   {self.stats['dropped_by_cap']:,} "
-              f"({self.stats['dropped_by_cap']/self.stats['total_annotations']*100:.1f}%)")
-        print(f"    Total dropped:            {total_dropped:,} "
-              f"({total_dropped/self.stats['total_annotations']*100:.1f}%)")
+        if self.stats['total_annotations'] > 0:
+            print(f"    Dropped by language:      {self.stats['dropped_by_language']:,} "
+                  f"({self.stats['dropped_by_language']/self.stats['total_annotations']*100:.1f}%)")
+            print(f"    Dropped by area filter:   {self.stats['dropped_by_area']:,} "
+                  f"({self.stats['dropped_by_area']/self.stats['total_annotations']*100:.1f}%)")
+            print(f"    Dropped by deduplication: {self.stats['dropped_by_dedup']:,} "
+                  f"({self.stats['dropped_by_dedup']/self.stats['total_annotations']*100:.1f}%)")
+            print(f"    Dropped by caption cap:   {self.stats['dropped_by_cap']:,} "
+                  f"({self.stats['dropped_by_cap']/self.stats['total_annotations']*100:.1f}%)")
+            print(f"    Total dropped:            {total_dropped:,} "
+                  f"({total_dropped/self.stats['total_annotations']*100:.1f}%)")
         
-        print(f"\n  Top 10 caption frequencies (English only):")
-        sorted_caps = sorted(
-            self.caption_frequencies.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:10]
-        for cap, count in sorted_caps:
-            display_cap = cap[:40] + "..." if len(cap) > 40 else cap
-            print(f"    [{count:4d}] \"{display_cap}\"")
+        # =====================================================================
+        # SPLIT STATISTICS (REQUIRED)
+        # =====================================================================
+        if hasattr(self, '_split_indices') and self._split_indices:
+            total = self.stats['final_samples']
+            train_n = len(self._split_indices['train'])
+            val_n = len(self._split_indices['val'])
+            test_n = len(self._split_indices['test'])
+            
+            print(f"\n  SAMPLE-LEVEL SPLIT STATISTICS:")
+            print(f"    Total curated samples: {total:,}")
+            print(f"    Train samples: {train_n:,} ({train_n/total*100:.1f}%)")
+            print(f"    Val samples:   {val_n:,} ({val_n/total*100:.1f}%)")
+            print(f"    Test samples:  {test_n:,} ({test_n/total*100:.1f}%)")
+            print(f"\n    [PASS] Sample-level split complete")
+            print(f"    [PASS] No leakage detected")
+            
+            if self.split:
+                print(f"\n    Current split: '{self.split}' ({len(self.samples):,} samples)")
+        
+        # Show top caption frequencies only if available
+        if hasattr(self, 'caption_frequencies') and self.caption_frequencies:
+            print(f"\n  Top 10 caption frequencies (English only):")
+            sorted_caps = sorted(
+                self.caption_frequencies.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:10]
+            for cap, count in sorted_caps:
+                display_cap = cap[:40] + "..." if len(cap) > 40 else cap
+                print(f"    [{count:4d}] \"{display_cap}\"")
         
         print("\n" + "=" * 60)
     
     def get_stats(self) -> Dict:
         """Return curation statistics dictionary."""
         return self.stats.copy()
+    
+    def get_split_info(self) -> Dict[str, int]:
+        """Return split statistics."""
+        if not hasattr(self, '_split_indices'):
+            return {}
+        return {
+            'total': self.stats['final_samples'],
+            'train': len(self._split_indices['train']),
+            'val': len(self._split_indices['val']),
+            'test': len(self._split_indices['test']),
+            'current_split': self.split,
+            'current_split_samples': len(self.samples),
+        }
 
 
 # =============================================================================
@@ -621,57 +898,114 @@ class CuratedCocoDataset(Dataset):
 
 def validate_dataset(json_path: str, image_dir: str):
     """
-    Validate the curated dataset and print statistics.
+    Validate the curated dataset with sample-level splits.
     
     Args:
         json_path: Path to COCO JSON
         image_dir: Path to images directory
     """
     print("=" * 60)
-    print("CURATED COCO DATASET VALIDATION")
+    print("CURATED COCO DATASET VALIDATION (WITH SAMPLE-LEVEL SPLITS)")
     print("=" * 60)
     
     config = CurationConfig()
-    print(f"\nConfiguration:\n{config}")
+    split_config = SplitConfig()
+    print(f"\nCuration Config:\n{config}")
+    print(f"\nSplit Config:\n{split_config}")
     
-    # Create dataset
-    dataset = CuratedCocoDataset(
+    # Create all three splits to validate
+    print("\n" + "-" * 60)
+    print("Creating TRAIN split...")
+    train_dataset = CuratedCocoDataset(
         json_path=json_path,
         image_dir=image_dir,
+        split="train",
         config=config,
+        split_config=split_config,
         verbose=True
     )
     
-    # Validate a few samples
+    print("\n" + "-" * 60)
+    print("Creating VAL split...")
+    val_dataset = CuratedCocoDataset(
+        json_path=json_path,
+        image_dir=image_dir,
+        split="val",
+        config=config,
+        split_config=split_config,
+        verbose=True
+    )
+    
+    print("\n" + "-" * 60)
+    print("Creating TEST split...")
+    test_dataset = CuratedCocoDataset(
+        json_path=json_path,
+        image_dir=image_dir,
+        split="test",
+        config=config,
+        split_config=split_config,
+        verbose=True
+    )
+    
+    # =========================================================================
+    # VALIDATE OUTPUT CONTRACT
+    # =========================================================================
     print("\n" + "=" * 60)
-    print("SAMPLE VALIDATION")
+    print("OUTPUT CONTRACT VALIDATION")
     print("=" * 60)
     
-    if len(dataset) > 0:
-        # Check first sample
-        sample = dataset[0]
-        print(f"\n  Sample 0:")
-        print(f"    Image size:    {sample['image'].size}")
-        print(f"    Caption:       \"{sample['caption'][:50]}...\"")
-        print(f"    Num instances: {sample['boxes'].shape[0]}")
-        print(f"    Boxes shape:   {sample['boxes'].shape}")
-        print(f"    Keypoints shape: {sample['keypoints'].shape}")
-        print(f"    Valid shape:   {sample['valid'].shape}")
-        print(f"    GT index:      {sample['gt_index']}")
+    if len(train_dataset) > 0:
+        sample = train_dataset[0]
         
-        # Verify GT index
-        assert sample['gt_index'] == 0, "GT index should be 0"
-        assert sample['valid'].all(), "All instances should be valid"
+        # Check required fields
+        required_fields = {"image", "caption", "boxes", "masks", "keypoints", "valid", "gt_index"}
+        actual_fields = set(sample.keys())
         
-        print(f"\n  [PASS] Sample structure validated")
-    else:
-        print(f"\n  [WARN] No samples in dataset")
+        assert actual_fields == required_fields, \
+            f"Output contract violated! Expected {required_fields}, got {actual_fields}"
+        
+        # Check types and shapes
+        from PIL import Image as PILImage
+        assert isinstance(sample['image'], PILImage.Image), "image must be PIL.Image"
+        assert isinstance(sample['caption'], str), "caption must be str"
+        assert isinstance(sample['boxes'], torch.Tensor), "boxes must be Tensor"
+        assert sample['boxes'].dim() == 2 and sample['boxes'].shape[1] == 4, "boxes must be [N, 4]"
+        assert isinstance(sample['masks'], list), "masks must be List"
+        assert isinstance(sample['keypoints'], torch.Tensor), "keypoints must be Tensor"
+        assert sample['keypoints'].dim() == 3 and sample['keypoints'].shape[1:] == (17, 3), \
+            "keypoints must be [N, 17, 3]"
+        assert isinstance(sample['valid'], torch.Tensor), "valid must be Tensor"
+        assert sample['gt_index'] == 0, "gt_index must be 0"
+        
+        print(f"  [PASS] Output contract preserved (7 fields, correct types/shapes)")
+        print(f"  [PASS] gt_index == 0 (GT is first)")
     
+    # =========================================================================
+    # FINAL VERIFICATION
+    # =========================================================================
     print("\n" + "=" * 60)
-    print("VALIDATION COMPLETE")
+    print("FINAL VERIFICATION")
     print("=" * 60)
     
-    return dataset
+    total = len(train_dataset) + len(val_dataset) + len(test_dataset)
+    print(f"\n  Train: {len(train_dataset):,} samples")
+    print(f"  Val:   {len(val_dataset):,} samples")
+    print(f"  Test:  {len(test_dataset):,} samples")
+    print(f"  Total: {total:,} samples")
+    
+    # Verify sum
+    split_info = train_dataset.get_split_info()
+    assert total == split_info['total'], f"Split sum mismatch!"
+    
+    print(f"\n  [PASS] len(train) + len(val) + len(test) == total_samples")
+    
+    print("\n" + "=" * 60)
+    print("The dataset is split at the sample (caption–instance) level,")
+    print("not at image level.")
+    print("This is intentional and correct for referring expression grounding.")
+    print("=" * 60)
+    
+    return train_dataset, val_dataset, test_dataset
 
 
 # =============================================================================
@@ -691,31 +1025,56 @@ if __name__ == "__main__":
     # Check if image directory exists
     if not Path(image_dir).exists():
         print(f"[WARN] Image directory not found: {image_dir}")
-        print(f"       Dataset will be created but samples cannot be loaded.")
-        print(f"       Creating dataset in stats-only mode...\n")
+        print(f"       Creating dataset in stats-only mode (no sample loading)...\n")
         
-        # Create dataset without loading images (stats only)
+        # Create dataset for split validation only
         config = CurationConfig()
+        split_config = SplitConfig()
         print(f"Configuration:\n{config}\n")
+        print(f"Split Config:\n{split_config}\n")
         
-        # Load JSON and curate
-        dataset = CuratedCocoDataset.__new__(CuratedCocoDataset)
-        dataset.json_path = Path(json_path)
-        dataset.image_dir = Path(image_dir)
-        dataset.config = config
-        dataset.verbose = True
-        dataset.stats = {
-            'total_images': 0,
-            'total_annotations': 0,
-            'dropped_by_language': 0,
-            'dropped_by_area': 0,
-            'dropped_by_dedup': 0,
-            'dropped_by_cap': 0,
-            'final_samples': 0,
-            'final_instances': 0,
-        }
-        dataset._load_coco_json()
-        dataset._curate_dataset()
-        dataset._print_statistics()
+        # Create train split (this will curate and compute splits)
+        train_ds = CuratedCocoDataset(
+            json_path=json_path,
+            image_dir=image_dir,
+            split="train",
+            config=config,
+            split_config=split_config,
+            verbose=True
+        )
+        
+        # Create val and test (will use cache)
+        val_ds = CuratedCocoDataset(
+            json_path=json_path,
+            image_dir=image_dir,
+            split="val",
+            config=config,
+            split_config=split_config,
+            verbose=True
+        )
+        
+        test_ds = CuratedCocoDataset(
+            json_path=json_path,
+            image_dir=image_dir,
+            split="test",
+            config=config,
+            split_config=split_config,
+            verbose=True
+        )
+        
+        print("\n" + "=" * 60)
+        print("SPLIT SUMMARY")
+        print("=" * 60)
+        print(f"  Train: {len(train_ds):,} samples")
+        print(f"  Val:   {len(val_ds):,} samples")
+        print(f"  Test:  {len(test_ds):,} samples")
+        total = len(train_ds) + len(val_ds) + len(test_ds)
+        print(f"  Total: {total:,} samples")
+        
+        print("\n" + "=" * 60)
+        print("The dataset is split at the sample (caption–instance) level,")
+        print("not at image level.")
+        print("This is intentional and correct for referring expression grounding.")
+        print("=" * 60)
     else:
         validate_dataset(json_path, image_dir)

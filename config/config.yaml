@@ -50,3 +50,17 @@ runtime:
   deterministic: true
   # Enable mixed precision (AMP) - only on CUDA
   mixed_precision: false
+
+# =============================================================================
+# SAMPLE-LEVEL SPLITS
+# =============================================================================
+# Splitting is done at the SAMPLE (caption-instance) level, NOT image level.
+# A sample = (image_id, caption, gt_human_index, candidate_humans)
+# This is intentional for referring expression grounding.
+splits:
+  # Train/val/test ratios (MUST sum to exactly 1.0)
+  train: 0.8
+  val: 0.1
+  test: 0.1
+  # Seed for deterministic shuffling (separate from runtime seed)
+  seed: 42

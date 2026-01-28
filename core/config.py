@@ -76,6 +76,24 @@ class RuntimeConfig:
 
 
 @dataclass
+class SplitsConfig:
+    """Sample-level train/val/test split configuration."""
+    train: float = 0.8
+    val: float = 0.1
+    test: float = 0.1
+    seed: int = 42
+    
+    def __post_init__(self):
+        """Validate split ratios sum to 1.0."""
+        total = self.train + self.val + self.test
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"Split ratios must sum to 1.0, got {total:.4f} "
+                f"(train={self.train}, val={self.val}, test={self.test})"
+            )
+
+
+@dataclass
 class Config:
     """
     Main configuration container.
@@ -88,6 +106,7 @@ class Config:
     training: TrainingConfig
     checkpoints: CheckpointsConfig
     runtime: RuntimeConfig
+    splits: SplitsConfig = field(default_factory=SplitsConfig)
     
     # Project root for resolving relative paths
     project_root: Path = field(default_factory=lambda: Path.cwd())
@@ -215,6 +234,12 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
     # Validate
     validate_config(raw)
     
+    # Handle optional splits section (with defaults)
+    if "splits" in raw and raw["splits"] is not None:
+        splits_config = SplitsConfig(**raw["splits"])
+    else:
+        splits_config = SplitsConfig()  # Use defaults
+    
     # Build typed config
     config = Config(
         dataset=DatasetConfig(**raw["dataset"]),
@@ -223,6 +248,7 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
         training=TrainingConfig(**raw["training"]),
         checkpoints=CheckpointsConfig(**raw["checkpoints"]),
         runtime=RuntimeConfig(**raw["runtime"]),
+        splits=splits_config,
         project_root=project_root,
     )
     

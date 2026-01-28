@@ -22,13 +22,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, Literal, TYPE_CHECKING
 
 from core.datatypes import (
     D_TOKEN,
@@ -454,9 +455,31 @@ def collate_variable_humans(batch: List[Dict]) -> Optional[Dict]:
 # CACHED FEATURE DATASET
 # =============================================================================
 
+# Module-level cache for sample splits (shared across dataset instances)
+_CACHED_SPLIT_INDICES: Dict[str, Dict[str, List[int]]] = {}
+
+
+def compute_sample_id_for_cache(image_id: str, ann_id: int, caption: str) -> str:
+    """
+    Compute unique sample ID for split assignment.
+    Must match the ID scheme in CuratedCocoDataset.
+    """
+    import hashlib
+    # Normalize caption
+    import string
+    text = caption.lower()
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    text = ' '.join(text.split()).strip()
+    cap_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
+    return f"{image_id}_{ann_id}_{cap_hash}"
+
+
 class CachedFeatureDataset(Dataset):
     """
     Dataset that loads precomputed YOLO features from cache.
+    
+    Supports sample-level train/val/test splits (NOT image-level).
+    A sample is defined as: (image_id, caption, gt_human_index).
     
     Each sample contains:
     - visual_embeddings: [N, 256]
@@ -472,11 +495,29 @@ class CachedFeatureDataset(Dataset):
         self, 
         cache_dir: Path, 
         coco_json_path: Path, 
+        split: Optional[Literal["train", "val", "test"]] = None,
+        split_config: Optional[Dict] = None,
         max_samples: Optional[int] = None,
         seed: int = 42,
     ):
+        """
+        Args:
+            cache_dir: Directory containing cached .pt files
+            coco_json_path: Path to COCO annotations JSON
+            split: Which split to load ("train", "val", "test", or None for all)
+            split_config: Dict with 'train', 'val', 'test' ratios and 'seed'
+            max_samples: Limit total samples (applied AFTER split)
+            seed: Random seed for sample limiting (not for splits)
+        """
         self.cache_dir = cache_dir
         self.seed = seed
+        self.split = split
+        self.split_config = split_config or {'train': 0.8, 'val': 0.1, 'test': 0.1, 'seed': 42}
+        
+        # Validate split ratios
+        total_ratio = self.split_config['train'] + self.split_config['val'] + self.split_config['test']
+        if abs(total_ratio - 1.0) > 1e-6:
+            raise ValueError(f"Split ratios must sum to 1.0, got {total_ratio}")
         
         # Get all cache files
         all_cache_files = sorted(list(cache_dir.glob("*.pt")))
@@ -484,6 +525,7 @@ class CachedFeatureDataset(Dataset):
         print(f"\nCachedFeatureDataset initializing...")
         print(f"  Cache directory: {cache_dir}")
         print(f"  Total cache files found: {len(all_cache_files)}")
+        print(f"  Split: {split if split else 'ALL'}")
         
         # Load COCO annotations
         print(f"  Loading COCO annotations from: {coco_json_path}")
@@ -500,7 +542,7 @@ class CachedFeatureDataset(Dataset):
         print(f"  Unique images with annotations: {len(self.image_id_to_anns)}")
         
         # Build valid sample list (without loading all cache files)
-        self.samples = []
+        self._all_samples = []
         
         for cache_file in tqdm(all_cache_files, desc="  Validating cache files"):
             image_id = cache_file.stem
@@ -517,27 +559,115 @@ class CachedFeatureDataset(Dataset):
                 if 'caption' not in ann or not ann['caption']:
                     continue
                 
-                self.samples.append({
+                # Compute stable sample ID for splitting
+                sample_id = compute_sample_id_for_cache(
+                    image_id, 
+                    ann.get('id', ann_idx),
+                    ann['caption']
+                )
+                
+                self._all_samples.append({
                     'cache_file': cache_file,
                     'image_id': image_id,
                     'ann_idx': ann_idx,
+                    'ann_id': ann.get('id', ann_idx),
                     'caption': ann['caption'],
                     'bbox': ann.get('bbox', None),
+                    'sample_id': sample_id,
                 })
         
-        print(f"  Valid samples (image + caption pairs): {len(self.samples)}")
+        print(f"  Total valid samples: {len(self._all_samples)}")
         
-        # Limit samples if requested
+        # =====================================================================
+        # SAMPLE-LEVEL SPLITTING
+        # =====================================================================
+        cache_key = str(coco_json_path.resolve())
+        
+        if cache_key not in _CACHED_SPLIT_INDICES:
+            # Compute splits once
+            self._compute_splits()
+            _CACHED_SPLIT_INDICES[cache_key] = self._split_indices
+        else:
+            self._split_indices = _CACHED_SPLIT_INDICES[cache_key]
+        
+        # Filter samples by split
+        if self.split is None:
+            self.samples = self._all_samples
+        else:
+            indices = self._split_indices[self.split]
+            self.samples = [self._all_samples[i] for i in indices]
+        
+        print(f"  Samples in '{split if split else 'ALL'}' split: {len(self.samples)}")
+        
+        # Limit samples if requested (AFTER split)
         if max_samples is not None and len(self.samples) > max_samples:
             import random
             random.seed(seed)
-            random.shuffle(self.samples)
-            self.samples = self.samples[:max_samples]
+            shuffled_indices = list(range(len(self.samples)))
+            random.shuffle(shuffled_indices)
+            self.samples = [self.samples[i] for i in shuffled_indices[:max_samples]]
             print(f"  Limited to: {len(self.samples)} samples")
+        
+        # Print split statistics
+        self._print_split_stats()
         
         # Cache for loaded features (LRU-style, limited size)
         self._cache = {}
         self._cache_max_size = 100
+    
+    def _compute_splits(self):
+        """Compute sample-level train/val/test splits."""
+        n_total = len(self._all_samples)
+        
+        if n_total == 0:
+            self._split_indices = {"train": [], "val": [], "test": []}
+            return
+        
+        # Shuffle indices deterministically
+        indices = list(range(n_total))
+        rng = random.Random(self.split_config['seed'])
+        rng.shuffle(indices)
+        
+        # Compute split boundaries
+        n_train = int(n_total * self.split_config['train'])
+        n_val = int(n_total * self.split_config['val'])
+        
+        self._split_indices = {
+            "train": indices[:n_train],
+            "val": indices[n_train:n_train + n_val],
+            "test": indices[n_train + n_val:],
+        }
+        
+        # Validate no leakage
+        train_ids = {self._all_samples[i]['sample_id'] for i in self._split_indices['train']}
+        val_ids = {self._all_samples[i]['sample_id'] for i in self._split_indices['val']}
+        test_ids = {self._all_samples[i]['sample_id'] for i in self._split_indices['test']}
+        
+        if train_ids & val_ids:
+            raise RuntimeError("[LEAKAGE] Samples in both train and val!")
+        if train_ids & test_ids:
+            raise RuntimeError("[LEAKAGE] Samples in both train and test!")
+        if val_ids & test_ids:
+            raise RuntimeError("[LEAKAGE] Samples in both val and test!")
+        
+        total_split = len(train_ids) + len(val_ids) + len(test_ids)
+        if total_split != n_total:
+            raise RuntimeError(f"[SPLIT ERROR] {total_split} != {n_total}")
+    
+    def _print_split_stats(self):
+        """Print split statistics."""
+        total = len(self._all_samples)
+        train_n = len(self._split_indices['train'])
+        val_n = len(self._split_indices['val'])
+        test_n = len(self._split_indices['test'])
+        
+        print(f"\n  SAMPLE-LEVEL SPLIT STATISTICS:")
+        print(f"    Total curated samples: {total:,}")
+        print(f"    Train samples: {train_n:,} ({train_n/total*100:.1f}%)")
+        print(f"    Val samples:   {val_n:,} ({val_n/total*100:.1f}%)")
+        print(f"    Test samples:  {test_n:,} ({test_n/total*100:.1f}%)")
+        print(f"    [PASS] Sample-level split complete")
+        print(f"    [PASS] No leakage detected")
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -760,15 +890,33 @@ def _run_training_loop(
     print("TASK 5: Preparing training loop")
     print("-" * 50)
     
-    # Compute max_samples safely
+    # Get split configuration from config.splits (typed dataclass)
+    split_config = {
+        'train': config.splits.train,
+        'val': config.splits.val,
+        'test': config.splits.test,
+        'seed': config.splits.seed,
+    }
+    
+    print(f"\n  Split configuration (sample-level, NOT image-level):")
+    print(f"    Train: {split_config['train']:.0%}")
+    print(f"    Val:   {split_config['val']:.0%}")
+    print(f"    Test:  {split_config['test']:.0%}")
+    print(f"    Seed:  {split_config['seed']}")
+    
+    # Compute max_samples safely (applied AFTER split)
     if max_steps_per_epoch is not None:
         max_samples = max_steps_per_epoch * batch_size * num_epochs
     else:
         max_samples = None
     
+    # Create TRAIN split dataset (sample-level, not image-level)
+    print("\n  Creating TRAIN split...")
     dataset = CachedFeatureDataset(
         cache_dir=cache_dir,
         coco_json_path=coco_json,
+        split="train",  # ONLY load train split
+        split_config=split_config,
         max_samples=max_samples,
         seed=config.runtime.seed,
     )
@@ -782,7 +930,9 @@ def _run_training_loop(
         drop_last=True,
     )
     
-    print(f"✓ DataLoader ready ({len(dataset)} samples, batch_size={batch_size})")
+    print(f"\n✓ DataLoader ready ({len(dataset)} TRAIN samples, batch_size={batch_size})")
+    print(f"  NOTE: Dataset is split at SAMPLE level, not image level.")
+    print(f"        This is intentional for referring expression grounding.")
     
     # Optimizer
     trainable_params = list(adapter.parameters()) + list(scorer.parameters())
