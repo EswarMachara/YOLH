@@ -19,9 +19,12 @@ OUTPUT:
         ├── pose_best.pt
         ├── seg_best.pt
         └── dataset/
-            ├── images/
-            ├── labels_pose/
-            └── labels_seg/
+            ├── pose/
+            │   ├── images/train, val
+            │   └── labels/train, val  # YOLO auto-discovers these
+            └── seg/
+                ├── images/train, val
+                └── labels/train, val
     
     outputs/logs/
         ├── yolo_pose_metrics.csv
@@ -46,7 +49,7 @@ import torch
 from ultralytics import YOLO
 
 from core.config import load_config, add_config_argument, Config
-from data.yolo_dataset_builder import build_yolo_dataset
+from data.yolo_dataset_builder import build_yolo_dataset, validate_yolo_dataset
 
 
 def assert_cuda_available():
@@ -175,6 +178,11 @@ def train_pose_model(
     print("FINE-TUNING YOLO POSE MODEL")
     print("=" * 60)
     
+    # CRITICAL: Validate dataset BEFORE starting training
+    # This catches the "0 images" problem early
+    dataset_dir = dataset_yaml.parent
+    validate_yolo_dataset(dataset_dir, task='pose')
+    
     # Load base model
     base_model = config.yolo.pose_model
     print(f"  Base model: {base_model}")
@@ -258,6 +266,11 @@ def train_seg_model(
     print("\n" + "=" * 60)
     print("FINE-TUNING YOLO SEGMENTATION MODEL")
     print("=" * 60)
+    
+    # CRITICAL: Validate dataset BEFORE starting training
+    # This catches the "0 images" problem early
+    dataset_dir = dataset_yaml.parent
+    validate_yolo_dataset(dataset_dir, task='seg')
     
     # Load base model
     base_model = config.yolo.seg_model
