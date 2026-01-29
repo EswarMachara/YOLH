@@ -1,148 +1,104 @@
-# =============================================================================
 # RefYOLO-Human Configuration
-# =============================================================================
 # Central configuration for dataset paths and runtime settings
-# Works on: Local VS Code (CPU), Lightning AI Studio (GPU), Kaggle, Colab
-# =============================================================================
+# Works on: local VS Code (CPU), Lightning AI Studio (GPU)
 
 dataset:
-  # Directory containing all images (FULL dataset)
+  # Directory containing training images
   images_dir: data/images
-
   # Path to COCO-format annotations JSON
   annotations_path: data/annotations.json
 
-
 cache:
-  # Directory for cached YOLO features (used by grounding training)
+  # Directory for cached YOLO features
   features_dir: cache
 
-
 models:
-  # ---------------------------------------------------------------------------
-  # BASE (pretrained) YOLO models
-  # These are used ONLY if yolo.fine_tune = false
-  # ---------------------------------------------------------------------------
+  # YOLO model paths (relative to project root)
+  # These are the BASE models (pretrained) - used if yolo.fine_tune is false
   pose_model: yolo11n-pose.pt
   seg_model: yolo11n-seg.pt
-
 
 # =============================================================================
 # YOLO FINE-TUNING CONFIGURATION
 # =============================================================================
-# YOLO is fine-tuned ONLY to improve visual features.
-# Grounding is the primary task, YOLO is a supporting component.
-# =============================================================================
+# Fine-tune YOLO segmentation model on the TRAIN split.
+# NOTE: Pose model already fine-tuned (pose_best.pt exists).
 yolo:
-  # ---------------------------------------------------------------------------
-  # Large YOLO variants (used as starting point for fine-tuning)
-  # ---------------------------------------------------------------------------
-  pose_model: yolo11l-pose.pt
+  # Segmentation model for fine-tuning
   seg_model: yolo11l-seg.pt
-
-  # ---------------------------------------------------------------------------
   # Enable fine-tuning mode
-  # ---------------------------------------------------------------------------
   fine_tune: true
-
-  # ---------------------------------------------------------------------------
-  # IMPORTANT:
-  # Pose fine-tuning is ALREADY DONE (pose_best.pt exists)
-  # We are NOW re-running SEG fine-tuning only.
-  # The training script will:
-  #   - Skip pose if pose_finetuned exists
-  #   - Train seg model from scratch (from yolo11l-seg.pt)
-  # ---------------------------------------------------------------------------
-
-  # -------------------------
   # Training hyperparameters
-  # -------------------------
-  epochs: 10          # Reduced for Kaggle time limits (can be increased later)
+  epochs: 50
   batch_size: 16
   img_size: 640
   learning_rate: 0.001
   weight_decay: 0.0005
-
-  # ---------------------------------------------------------------------------
-  # Output directory for fine-tuned YOLO models
-  # ---------------------------------------------------------------------------
+  # Output directory for fine-tuned weights
   output_dir: checkpoints/yolo_finetuned
+  # Paths to fine-tuned weights (used when fine_tune=true for caching/inference)
+  pose_finetuned: checkpoints/yolo_finetuned/pose_best.pt  # Already trained
+  seg_finetuned: checkpoints/yolo_finetuned/seg_best.pt    # To be trained
 
-  # ---------------------------------------------------------------------------
-  # Fine-tuned weights
-  # These paths are CRITICAL:
-  # - pose_finetuned already exists
-  # - seg_finetuned will be produced in this run
-  # ---------------------------------------------------------------------------
-  pose_finetuned: checkpoints/yolo_finetuned/pose_best.pt
-  seg_finetuned: checkpoints/yolo_finetuned/seg_best.pt
-
-  # ---------------------------------------------------------------------------
-  # OPTIONAL SAFETY SWITCHES (commented, not removed)
-  # Uncomment ONLY if you want to explicitly control training
-  # ---------------------------------------------------------------------------
-
-  # train_pose: false     # Explicitly skip pose fine-tuning
-  # train_seg: true       # Explicitly enable seg fine-tuning
-
-
-# =============================================================================
-# GROUNDING TRAINING CONFIGURATION
-# =============================================================================
 training:
+  # Device: "cuda" for GPU, "cpu" for CPU-only
   device: cuda
-
+  # Batch size for training
   batch_size: 8
+  # Number of training epochs
   num_epochs: 20
+  # DataLoader workers (0 for main thread)
   num_workers: 0
-
+  # Learning rate
   learning_rate: 1.0e-4
+  # Weight decay for AdamW
   weight_decay: 1.0e-4
+  # Gradient clipping max norm
   grad_clip_norm: 1.0
-
-  # null = full dataset
+  # Max steps per epoch (null for full dataset)
   max_steps_per_epoch: null
 
-
-# =============================================================================
-# CHECKPOINT MANAGEMENT
-# =============================================================================
 checkpoints:
+  # Directory for saving checkpoints
   save_dir: checkpoints
+  # Save checkpoint every N epochs
   save_every_epochs: 1
+  # Keep best model based on margin success rate
   keep_best: true
 
-
-# =============================================================================
-# RUNTIME SETTINGS
-# =============================================================================
 runtime:
+  # Random seed for reproducibility
   seed: 42
+  # Enable deterministic mode
   deterministic: true
-
-  # Mixed precision for grounding (YOLO AMP is handled internally)
+  # Enable mixed precision (AMP) - only on CUDA
   mixed_precision: false
 
-
 # =============================================================================
-# SAMPLE-LEVEL SPLITS (CRITICAL FOR GROUNDING)
+# SAMPLE-LEVEL SPLITS
 # =============================================================================
-# Split is done at SAMPLE LEVEL, not image level.
-# A sample = (image_id, instance_id, caption)
-# =============================================================================
+# Splitting is done at the SAMPLE (caption-instance) level, NOT image level.
+# A sample = (image_id, caption, gt_human_index, candidate_humans)
+# This is intentional for referring expression grounding.
 splits:
+  # Train/val/test ratios (MUST sum to exactly 1.0)
   train: 0.8
   val: 0.1
   test: 0.1
+  # Seed for deterministic shuffling (separate from runtime seed)
   seed: 42
 
-
 # =============================================================================
-# OUTPUT ARTIFACTS
+# OUTPUTS CONFIGURATION
 # =============================================================================
 outputs:
+  # Base output directory for all artifacts
   base_dir: outputs
+  # Directory for CSV logs
   logs_dir: outputs/logs
+  # Directory for visualizations
   visualizations_dir: outputs/visualizations
+  # Directory for plots
   plots_dir: outputs/plots
+  # Directory for evaluation results
   evaluation_dir: outputs/evaluation

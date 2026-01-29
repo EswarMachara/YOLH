@@ -2,8 +2,10 @@
 """
 YOLO Fine-Tuning Script for RefYOLO-Human
 
-Fine-tunes large YOLO models (pose and segmentation) on the TRAIN split.
+Fine-tunes YOLO segmentation model on the TRAIN split.
 Uses the Ultralytics YOLO API for training.
+
+NOTE: Pose model already fine-tuned separately. This script is seg-only.
 
 CONSTRAINTS:
 - ✅ CUDA only (no CPU fallback)
@@ -16,18 +18,13 @@ CONSTRAINTS:
 
 OUTPUT:
     checkpoints/yolo_finetuned/
-        ├── pose_best.pt
         ├── seg_best.pt
         └── dataset/
-            ├── pose/
-            │   ├── images/train, val
-            │   └── labels/train, val  # YOLO auto-discovers these
             └── seg/
                 ├── images/train, val
                 └── labels/train, val
     
     outputs/logs/
-        ├── yolo_pose_metrics.csv
         └── yolo_seg_metrics.csv
 
 USAGE:
@@ -117,15 +114,13 @@ def parse_yolo_results(results_dir: Path) -> Dict[str, Any]:
 def save_yolo_metrics_csv(
     epochs_data: list,
     output_path: Path,
-    model_type: str,  # 'pose' or 'seg'
 ):
     """
-    Save YOLO training metrics to standardized CSV.
+    Save YOLO segmentation training metrics to standardized CSV.
     
     Args:
         epochs_data: List of epoch dictionaries from YOLO results
         output_path: Path to save CSV
-        model_type: 'pose' or 'seg'
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -135,7 +130,6 @@ def save_yolo_metrics_csv(
         "val_loss",
         "mAP50_box",
         "mAP50_mask",
-        "OKS_pose",
         "timestamp",
     ]
     
@@ -149,102 +143,12 @@ def save_yolo_metrics_csv(
                 "train_loss": data.get("train/box_loss", data.get("train/cls_loss", "")),
                 "val_loss": data.get("val/box_loss", data.get("val/cls_loss", "")),
                 "mAP50_box": data.get("metrics/mAP50(B)", ""),
-                "mAP50_mask": data.get("metrics/mAP50(M)", "") if model_type == "seg" else "",
-                "OKS_pose": data.get("metrics/mAP50(P)", "") if model_type == "pose" else "",
+                "mAP50_mask": data.get("metrics/mAP50(M)", ""),
                 "timestamp": datetime.now().isoformat(),
             }
             writer.writerow(row)
     
-    print(f"✓ Saved {model_type} metrics to: {output_path}")
-
-
-def train_pose_model(
-    config: Config,
-    dataset_yaml: Path,
-    output_dir: Path,
-) -> Path:
-    """
-    Fine-tune YOLO pose model.
-    
-    Args:
-        config: Configuration object
-        dataset_yaml: Path to dataset YAML
-        output_dir: Output directory for checkpoints
-        
-    Returns:
-        Path to best weights
-    """
-    print("\n" + "=" * 60)
-    print("FINE-TUNING YOLO POSE MODEL")
-    print("=" * 60)
-    
-    # CRITICAL: Validate dataset BEFORE starting training
-    # This catches the "0 images" problem early
-    dataset_dir = dataset_yaml.parent
-    validate_yolo_dataset(dataset_dir, task='pose')
-    
-    # Load base model
-    base_model = config.yolo.pose_model
-    print(f"  Base model: {base_model}")
-    print(f"  Dataset: {dataset_yaml}")
-    
-    model = YOLO(base_model)
-    
-    # Training parameters from config
-    results = model.train(
-        data=str(dataset_yaml),
-        epochs=config.yolo.epochs,
-        batch=config.yolo.batch_size,
-        imgsz=config.yolo.img_size,
-        lr0=config.yolo.learning_rate,
-        weight_decay=config.yolo.weight_decay,
-        device=0,  # Use first GPU
-        project=str(output_dir / 'runs'),
-        name='pose',
-        exist_ok=True,
-        verbose=True,
-        plots=True,
-        save=True,
-        save_period=5,  # Save every 5 epochs
-        patience=10,  # Early stopping patience
-        workers=4,
-        seed=config.runtime.seed,
-    )
-    
-    # Parse and save metrics to CSV
-    run_dir = output_dir / 'runs' / 'pose'
-    epochs_data = parse_yolo_results(run_dir)
-    if epochs_data:
-        csv_path = config.logs_dir / "yolo_pose_metrics.csv"
-        save_yolo_metrics_csv(epochs_data, csv_path, "pose")
-        
-        # Print per-epoch summary
-        print("\n  Per-epoch metrics (pose):")
-        print(f"  {'Epoch':>6} {'Train Loss':>12} {'Val Loss':>12} {'mAP50(P)':>12}")
-        print("  " + "-" * 48)
-        for i, data in enumerate(epochs_data[-5:], start=max(1, len(epochs_data)-4)):
-            tl = data.get("train/box_loss", "N/A")
-            vl = data.get("val/box_loss", "N/A")
-            mp = data.get("metrics/mAP50(P)", "N/A")
-            print(f"  {i:>6} {str(tl):>12} {str(vl):>12} {str(mp):>12}")
-    
-    # Copy best weights to standard location
-    best_weights = output_dir / 'runs' / 'pose' / 'weights' / 'best.pt'
-    final_path = output_dir / 'pose_best.pt'
-    
-    if best_weights.exists():
-        shutil.copy2(best_weights, final_path)
-        print(f"✓ Pose model saved: {final_path}")
-    else:
-        # Fall back to last weights
-        last_weights = output_dir / 'runs' / 'pose' / 'weights' / 'last.pt'
-        if last_weights.exists():
-            shutil.copy2(last_weights, final_path)
-            print(f"✓ Pose model saved (last): {final_path}")
-        else:
-            raise RuntimeError("No pose model weights found after training!")
-    
-    return final_path
+    print(f"✓ Saved seg metrics to: {output_path}")
 
 
 def train_seg_model(
@@ -305,7 +209,7 @@ def train_seg_model(
     epochs_data = parse_yolo_results(run_dir)
     if epochs_data:
         csv_path = config.logs_dir / "yolo_seg_metrics.csv"
-        save_yolo_metrics_csv(epochs_data, csv_path, "seg")
+        save_yolo_metrics_csv(epochs_data, csv_path)
         
         # Print per-epoch summary
         print("\n  Per-epoch metrics (seg):")
@@ -337,21 +241,11 @@ def train_seg_model(
 
 
 def main():
-    """Main entry point for YOLO fine-tuning."""
+    """Main entry point for YOLO segmentation fine-tuning."""
     parser = argparse.ArgumentParser(
-        description="Fine-tune YOLO pose and segmentation models"
+        description="Fine-tune YOLO segmentation model (pose already done)"
     )
     add_config_argument(parser)
-    parser.add_argument(
-        "--pose-only",
-        action="store_true",
-        help="Train only pose model"
-    )
-    parser.add_argument(
-        "--seg-only",
-        action="store_true",
-        help="Train only segmentation model"
-    )
     parser.add_argument(
         "--skip-dataset-build",
         action="store_true",
@@ -360,7 +254,7 @@ def main():
     args = parser.parse_args()
     
     print("=" * 60)
-    print("YOLO FINE-TUNING FOR RefYOLO-Human")
+    print("YOLO SEGMENTATION FINE-TUNING FOR RefYOLO-Human")
     print("=" * 60)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -385,7 +279,6 @@ def main():
     
     # Print config
     print("\n[CONFIGURATION]")
-    print(f"  Pose model: {config.yolo.pose_model}")
     print(f"  Seg model: {config.yolo.seg_model}")
     print(f"  Epochs: {config.yolo.epochs}")
     print(f"  Batch size: {config.yolo.batch_size}")
@@ -421,34 +314,21 @@ def main():
         if not dataset_dir.exists():
             raise RuntimeError(f"Dataset directory not found: {dataset_dir}")
     
-    # Paths to dataset YAMLs
-    pose_yaml = dataset_dir / 'dataset_pose.yaml'
+    # Path to dataset YAML (seg only)
     seg_yaml = dataset_dir / 'dataset_seg.yaml'
     
-    if not pose_yaml.exists():
-        raise RuntimeError(f"Pose dataset YAML not found: {pose_yaml}")
     if not seg_yaml.exists():
         raise RuntimeError(f"Seg dataset YAML not found: {seg_yaml}")
     
-    # Train models
-    pose_path = None
-    seg_path = None
-    
-    if not args.seg_only:
-        pose_path = train_pose_model(config, pose_yaml, output_dir)
-    
-    if not args.pose_only:
-        seg_path = train_seg_model(config, seg_yaml, output_dir)
+    # Train segmentation model
+    seg_path = train_seg_model(config, seg_yaml, output_dir)
     
     # Final summary
     print("\n" + "=" * 60)
-    print("YOLO FINE-TUNING COMPLETE")
+    print("YOLO SEGMENTATION FINE-TUNING COMPLETE")
     print("=" * 60)
     
-    if pose_path:
-        print(f"  ✓ Pose weights: {pose_path}")
-    if seg_path:
-        print(f"  ✓ Seg weights: {seg_path}")
+    print(f"  ✓ Seg weights: {seg_path}")
     
     print(f"\nFinished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
