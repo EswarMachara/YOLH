@@ -21,24 +21,29 @@ models:
 # =============================================================================
 # YOLO FINE-TUNING CONFIGURATION
 # =============================================================================
-# Fine-tune YOLO segmentation model on the TRAIN split.
-# NOTE: Pose model already fine-tuned (pose_best.pt exists).
+# YOLO fine-tuning is COMPLETE. Fine-tuned weights are in YOLO_finetuning/
+# DO NOT run fine-tuning again - use the existing weights below.
 yolo:
-  # Segmentation model for fine-tuning
+  # Base model for fine-tuning (reference only - NOT used for inference)
+  pose_model: yolo11l-pose.pt
   seg_model: yolo11l-seg.pt
-  # Enable fine-tuning mode
+  # Fine-tuning mode - enables use of fine-tuned weights for caching/inference
   fine_tune: true
-  # Training hyperparameters
-  epochs: 30
+  # Training hyperparameters (reference only - fine-tuning already complete)
+  epochs: 50
   batch_size: 16
   img_size: 640
   learning_rate: 0.001
   weight_decay: 0.0005
-  # Output directory for fine-tuned weights
-  output_dir: checkpoints/yolo_finetuned
-  # Paths to fine-tuned weights (used when fine_tune=true for caching/inference)
-  pose_finetuned: checkpoints/yolo_finetuned/pose_best.pt  # Already trained
-  seg_finetuned: checkpoints/yolo_finetuned/seg_best.pt    # To be trained
+  # Output directory for fine-tuned weights (legacy - keeping for compatibility)
+  output_dir: YOLO_finetuning
+  # ==========================================================================
+  # FINE-TUNED WEIGHTS - THESE ARE ACTIVELY USED
+  # ==========================================================================
+  # Paths to fine-tuned weights (REQUIRED when fine_tune=true)
+  # These files MUST exist before running feature caching or training
+  pose_finetuned: YOLO_finetuning/pose_best.pt
+  seg_finetuned: YOLO_finetuning/seg_best.pt
 
 training:
   # Device: "cuda" for GPU, "cpu" for CPU-only
