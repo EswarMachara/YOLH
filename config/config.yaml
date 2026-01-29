@@ -29,7 +29,7 @@ yolo:
   # Enable fine-tuning mode
   fine_tune: true
   # Training hyperparameters
-  epochs: 50
+  epochs: 30
   batch_size: 16
   img_size: 640
   learning_rate: 0.001
