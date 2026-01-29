@@ -30,7 +30,7 @@ yolo:
   # Fine-tuning mode - enables use of fine-tuned weights for caching/inference
   fine_tune: true
   # Training hyperparameters (reference only - fine-tuning already complete)
-  epochs: 50
+  epochs: 30
   batch_size: 16
   img_size: 640
   learning_rate: 0.001
@@ -49,9 +49,9 @@ training:
   # Device: "cuda" for GPU, "cpu" for CPU-only
   device: cuda
   # Batch size for training
-  batch_size: 8
+  batch_size: 16
   # Number of training epochs
-  num_epochs: 20
+  num_epochs: 50
   # DataLoader workers (0 for main thread)
   num_workers: 0
   # Learning rate
