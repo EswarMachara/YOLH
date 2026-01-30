@@ -10,6 +10,7 @@ runs/
 logs/
 wandb/
 lightning_logs/
+outputs/
 
 # ===== Python cache =====
 __pycache__/
@@ -24,7 +25,11 @@ data/images_200/
 data/annotations*.json
 *.json 
 images_200
+docs/*
 
 # Python
 __pycache__/
 *.pyc
+
+# ===== Notebooks (if experimental) =====
+notebooks/*.ipynb
