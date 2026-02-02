@@ -33,6 +33,7 @@ class CSVLogger:
     """
     
     # Standard columns for grounding metrics
+    # Note: rejection_accuracy removed - dataset contains no rejection samples
     GROUNDING_COLUMNS = [
         "epoch",
         "loss",
@@ -40,7 +41,7 @@ class CSVLogger:
         "accuracy_at_1",
         "mean_gt_rank",
         "pck_50",
-        "rejection_accuracy",
+        # "rejection_accuracy",  # Disabled: dataset contains no rejection samples
         "avg_gt_score",
         "avg_max_neg_score",
         "timestamp",

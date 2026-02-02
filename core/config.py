@@ -120,6 +120,38 @@ class OutputsConfig:
 
 
 @dataclass
+class CrossAttentionConfig:
+    """Cross-attention adapter specific configuration."""
+    num_heads: int = 4
+    num_layers: int = 1
+    dim_feedforward: int = 512
+    dropout: float = 0.1
+
+
+@dataclass
+class GroundingConfig:
+    """
+    Grounding adapter configuration.
+    
+    Controls the fusion mechanism between text query and visual tokens.
+    Phase-1 improvement: cross_attention replaces film (baseline).
+    """
+    # Adapter type: "cross_attention" (Phase-1) or "film" (baseline)
+    adapter_type: str = "cross_attention"
+    # Cross-attention specific settings
+    cross_attention: CrossAttentionConfig = field(default_factory=CrossAttentionConfig)
+    
+    def __post_init__(self):
+        """Validate adapter type."""
+        valid_types = ["cross_attention", "film"]
+        if self.adapter_type not in valid_types:
+            raise ValueError(
+                f"Invalid adapter_type: '{self.adapter_type}'. "
+                f"Must be one of: {valid_types}"
+            )
+
+
+@dataclass
 class Config:
     """
     Main configuration container.
@@ -135,6 +167,7 @@ class Config:
     splits: SplitsConfig = field(default_factory=SplitsConfig)
     yolo: YOLOConfig = field(default_factory=YOLOConfig)
     outputs: OutputsConfig = field(default_factory=OutputsConfig)
+    grounding: GroundingConfig = field(default_factory=GroundingConfig)
     
     # Project root for resolving relative paths
     project_root: Path = field(default_factory=lambda: Path.cwd())
@@ -329,6 +362,21 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
     else:
         outputs_config = OutputsConfig()  # Use defaults
     
+    # Handle optional grounding section (with defaults)
+    if "grounding" in raw and raw["grounding"] is not None:
+        grounding_raw = raw["grounding"]
+        # Parse cross_attention nested config if present
+        if "cross_attention" in grounding_raw and grounding_raw["cross_attention"] is not None:
+            ca_config = CrossAttentionConfig(**grounding_raw["cross_attention"])
+        else:
+            ca_config = CrossAttentionConfig()
+        grounding_config = GroundingConfig(
+            adapter_type=grounding_raw.get("adapter_type", "cross_attention"),
+            cross_attention=ca_config,
+        )
+    else:
+        grounding_config = GroundingConfig()  # Use defaults
+    
     # Build typed config
     config = Config(
         dataset=DatasetConfig(**raw["dataset"]),
@@ -340,6 +388,7 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
         splits=splits_config,
         yolo=yolo_config,
         outputs=outputs_config,
+        grounding=grounding_config,
         project_root=project_root,
     )
     

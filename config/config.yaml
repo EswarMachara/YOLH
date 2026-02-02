@@ -94,6 +94,24 @@ splits:
   seed: 42
 
 # =============================================================================
+# GROUNDING ADAPTER CONFIGURATION
+# =============================================================================
+# Controls the fusion mechanism between text query and visual tokens
+grounding:
+  # Adapter type: "cross_attention" (Phase-1 improvement) or "film" (baseline)
+  adapter_type: cross_attention
+  # Cross-attention specific settings (ignored if adapter_type=film)
+  cross_attention:
+    # Number of attention heads (4 or 8)
+    num_heads: 4
+    # Number of transformer layers (1 or 2)
+    num_layers: 1
+    # FFN hidden dimension
+    dim_feedforward: 512
+    # Dropout rate (0.0 for deterministic)
+    dropout: 0.1
+
+# =============================================================================
 # OUTPUTS CONFIGURATION
 # =============================================================================
 outputs:

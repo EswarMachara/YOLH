@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Literal, TYPE_CHECKING, Tuple
 from core.datatypes import D_TOKEN, D_QUERY
 from core.metrics import MetricsComputer, GroundingMetrics, format_metrics_table
 from core.logging import CSVLogger
+from adapter.cross_attention_adapter import CrossAttentionAdapter, create_grounding_adapter
 
 if TYPE_CHECKING:
     from core.config import Config
@@ -741,10 +742,40 @@ def _run_training_loop(
         param.requires_grad = False
     print(f"✓ SimpleQueryEncoder loaded (frozen)")
     
-    adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
+    # ==========================================================================
+    # ADAPTER SELECTION (Phase-1: cross_attention vs film baseline)
+    # ==========================================================================
+    adapter_type = config.grounding.adapter_type
+    print(f"\n  Adapter type from config: {adapter_type}")
+    
+    if adapter_type == "cross_attention":
+        # Phase-1 improvement: Cross-Attention based grounding
+        ca_config = config.grounding.cross_attention
+        adapter = create_grounding_adapter(
+            adapter_type="cross_attention",
+            token_dim=D_TOKEN,
+            query_dim=D_QUERY,
+            num_heads=ca_config.num_heads,
+            num_layers=ca_config.num_layers,
+            dim_feedforward=ca_config.dim_feedforward,
+            dropout=ca_config.dropout,
+        )
+        print(f"✓ CrossAttentionAdapter initialized (trainable)")
+        print(f"    num_heads: {ca_config.num_heads}")
+        print(f"    num_layers: {ca_config.num_layers}")
+        print(f"    dim_feedforward: {ca_config.dim_feedforward}")
+        print(f"    dropout: {ca_config.dropout}")
+    else:
+        # Baseline: FiLM-style adapter
+        adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
+        print(f"✓ TrainableAdapter (FiLM) initialized (trainable)")
+    
     adapter.to(device)
     adapter.train()
-    print(f"✓ TrainableAdapter initialized (trainable)")
+    
+    # Count adapter parameters
+    adapter_params = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
+    print(f"    Trainable parameters: {adapter_params:,}")
     
     scorer = TrainableScorer(token_dim=D_TOKEN, query_dim=D_QUERY)
     scorer.to(device)
@@ -866,6 +897,20 @@ def _run_training_loop(
     print(f"  Val log: {logs_dir / 'val_metrics.csv'}")
     
     # =========================================================================
+    # METRICS & SELECTION CRITERIA
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("Metrics enabled:")
+    print("-" * 50)
+    print("  - Margin Success Rate (PRIMARY)")
+    print("  - Accuracy@1")
+    print("  - Mean GT Rank")
+    print("  - PCK@50 (Train / Val / Test)")
+    print("  - Avg GT Score / Avg Max Neg Score")
+    print("\n  Best model selection criterion: VAL Margin Success Rate")
+    
+    # =========================================================================
     # TRAINING LOOP
     # =========================================================================
     
@@ -940,13 +985,21 @@ def _run_training_loop(
             optimizer.step()
             scheduler.step()
             
-            # Accumulate metrics
+            # Accumulate metrics (including PCK@50 - requires keypoints/boxes)
             with torch.no_grad():
+                # Compute predicted indices for PCK (argmax of scores over valid humans)
+                valid_scores = scores.clone()
+                valid_scores[~valid] = float('-inf')
+                pred_indices = valid_scores.argmax(dim=1)  # [B]
+                
                 batch_metrics = train_metrics_computer.compute_batch_metrics(
                     scores=scores,
                     gt_indices=gt_indices,
                     valid=valid,
                     loss=total_loss,
+                    keypoints_pred=keypoints,
+                    keypoints_gt=keypoints[torch.arange(B, device=device), gt_indices.clamp(0, N-1)],
+                    boxes=boxes,
                 )
                 train_metrics_computer.accumulate(batch_metrics)
             
@@ -964,6 +1017,7 @@ def _run_training_loop(
         train_metrics = train_metrics_computer.get_accumulated_metrics()
         
         # Log training metrics
+        # Note: rejection_accuracy removed - dataset contains no rejection samples
         train_logger.log({
             "epoch": epoch + 1,
             "loss": train_metrics.loss,
@@ -971,7 +1025,6 @@ def _run_training_loop(
             "accuracy_at_1": train_metrics.accuracy_at_1,
             "mean_gt_rank": train_metrics.mean_gt_rank,
             "pck_50": train_metrics.pck_50,
-            "rejection_accuracy": train_metrics.rejection_accuracy,
             "avg_gt_score": train_metrics.avg_gt_score,
             "avg_max_neg_score": train_metrics.avg_max_neg_score,
         })
@@ -992,6 +1045,7 @@ def _run_training_loop(
         )
         
         # Log validation metrics
+        # Note: rejection_accuracy removed - dataset contains no rejection samples
         val_logger.log({
             "epoch": epoch + 1,
             "loss": val_metrics.loss,
@@ -999,7 +1053,6 @@ def _run_training_loop(
             "accuracy_at_1": val_metrics.accuracy_at_1,
             "mean_gt_rank": val_metrics.mean_gt_rank,
             "pck_50": val_metrics.pck_50,
-            "rejection_accuracy": val_metrics.rejection_accuracy,
             "avg_gt_score": val_metrics.avg_gt_score,
             "avg_max_neg_score": val_metrics.avg_max_neg_score,
         })

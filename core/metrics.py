@@ -33,7 +33,8 @@ class GroundingMetrics:
     accuracy_at_1: float = 0.0
     mean_gt_rank: float = 0.0
     pck_50: float = 0.0
-    rejection_accuracy: float = 0.0
+    # Rejection accuracy disabled: dataset contains no rejection samples (n_samples_without_gt = 0)
+    # rejection_accuracy: float = 0.0
     avg_gt_score: float = 0.0
     avg_max_neg_score: float = 0.0
     
@@ -41,6 +42,8 @@ class GroundingMetrics:
     n_samples: int = 0
     n_samples_with_gt: int = 0
     n_samples_without_gt: int = 0
+    # Rejection accuracy disabled: dataset contains no rejection samples
+    # Keeping field for internal accumulator compatibility, but never computed/output
     n_correct_rejections: int = 0
     n_margin_successes: int = 0
     n_accuracy_at_1_correct: int = 0
@@ -59,7 +62,8 @@ class GroundingMetrics:
             "accuracy_at_1": self.accuracy_at_1,
             "mean_gt_rank": self.mean_gt_rank,
             "pck_50": self.pck_50,
-            "rejection_accuracy": self.rejection_accuracy,
+            # Rejection accuracy disabled: dataset contains no rejection samples
+            # "rejection_accuracy": self.rejection_accuracy,
             "avg_gt_score": self.avg_gt_score,
             "avg_max_neg_score": self.avg_max_neg_score,
             "n_samples": self.n_samples,
@@ -275,9 +279,9 @@ class MetricsComputer:
         if n_max_neg > 0:
             metrics.avg_max_neg_score = metrics.sum_max_neg_score / n_max_neg
         
-        # Rejection Accuracy
-        if metrics.n_samples_without_gt > 0:
-            metrics.rejection_accuracy = metrics.n_correct_rejections / metrics.n_samples_without_gt
+        # Rejection accuracy disabled: dataset contains no rejection samples
+        # if metrics.n_samples_without_gt > 0:
+        #     metrics.rejection_accuracy = metrics.n_correct_rejections / metrics.n_samples_without_gt
         
         # PCK@50
         if metrics.n_keypoints_evaluated > 0:
@@ -410,7 +414,8 @@ def format_metrics_table(metrics: GroundingMetrics, title: str = "Metrics") -> s
         f"  {'Accuracy@1':<30} {metrics.accuracy_at_1*100:>14.2f}%",
         f"  {'Mean GT Rank':<30} {metrics.mean_gt_rank:>15.2f}",
         f"  {'PCK@50':<30} {metrics.pck_50*100:>14.2f}%",
-        f"  {'Rejection Accuracy':<30} {metrics.rejection_accuracy*100:>14.2f}%",
+        # Rejection accuracy disabled: dataset contains no rejection samples
+        # f"  {'Rejection Accuracy':<30} {metrics.rejection_accuracy*100:>14.2f}%",
         f"  {'Avg GT Score':<30} {metrics.avg_gt_score:>15.4f}",
         f"  {'Avg Max Neg Score':<30} {metrics.avg_max_neg_score:>15.4f}",
         "-" * 60,

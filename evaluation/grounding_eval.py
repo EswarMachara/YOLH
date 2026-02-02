@@ -46,6 +46,7 @@ from training.grounding_train_v2 import (
     CachedFeatureDataset,
     collate_variable_humans,
 )
+from adapter.cross_attention_adapter import CrossAttentionAdapter, create_grounding_adapter
 
 
 def load_checkpoint(checkpoint_path: Path, device: str) -> Dict:
@@ -170,6 +171,7 @@ def save_results(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Save CSV
+    # Note: rejection_accuracy removed - dataset contains no rejection samples
     csv_path = output_dir / "metrics_test.csv"
     csv_logger = CSVLogger(csv_path, overwrite=True)
     csv_logger.log({
@@ -179,7 +181,6 @@ def save_results(
         "accuracy_at_1": metrics.accuracy_at_1,
         "mean_gt_rank": metrics.mean_gt_rank,
         "pck_50": metrics.pck_50,
-        "rejection_accuracy": metrics.rejection_accuracy,
         "avg_gt_score": metrics.avg_gt_score,
         "avg_max_neg_score": metrics.avg_max_neg_score,
     })
@@ -284,11 +285,28 @@ def main():
     query_encoder.eval()
     print("✓ Query encoder loaded")
     
-    adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
+    # Create adapter based on config (must match training configuration)
+    adapter_type = config.grounding.adapter_type
+    if adapter_type == "cross_attention":
+        ca_config = config.grounding.cross_attention
+        adapter = create_grounding_adapter(
+            adapter_type="cross_attention",
+            token_dim=D_TOKEN,
+            query_dim=D_QUERY,
+            num_heads=ca_config.num_heads,
+            num_layers=ca_config.num_layers,
+            dim_feedforward=ca_config.dim_feedforward,
+            dropout=ca_config.dropout,
+        )
+        print(f"✓ CrossAttentionAdapter created (matching config)")
+    else:
+        adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
+        print(f"✓ TrainableAdapter (FiLM) created")
+    
     adapter.load_state_dict(checkpoint["adapter"])
     adapter.to(device)
     adapter.eval()
-    print("✓ Adapter loaded from checkpoint")
+    print("✓ Adapter weights loaded from checkpoint")
     
     scorer = TrainableScorer(token_dim=D_TOKEN, query_dim=D_QUERY)
     scorer.load_state_dict(checkpoint["scorer"])
