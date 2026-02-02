@@ -118,7 +118,7 @@ grounding:
   # Set enabled: true to activate Phase-2 improvements
   hard_negative_mining:
     # Master switch - set to true for Phase-2 experiments
-    enabled: false
+    enabled: true
     # Difficulty score weights (must sum to 1.0)
     # Higher weight = more influence on difficulty score
     weight_iou: 0.5      # IoU overlap with GT (spatial proximity)
