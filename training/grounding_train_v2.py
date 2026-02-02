@@ -44,6 +44,9 @@ from core.metrics import MetricsComputer, GroundingMetrics, format_metrics_table
 from core.logging import CSVLogger
 from adapter.cross_attention_adapter import CrossAttentionAdapter, create_grounding_adapter
 
+# Phase-2: Hard Negative Mining
+from training.hard_negative_mining import HardNegativeMiner, WeightedMIRLLoss
+
 if TYPE_CHECKING:
     from core.config import Config
 
@@ -782,8 +785,32 @@ def _run_training_loop(
     scorer.train()
     print(f"✓ TrainableScorer initialized (trainable)")
     
-    mirl_loss_fn = MIRLLoss(margin=0.2, lambda_reject=0.1)
-    print(f"✓ MIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
+    # ==========================================================================
+    # LOSS FUNCTION SELECTION (Phase-2: Hard Negative Mining)
+    # ==========================================================================
+    hnm_config = config.grounding.hard_negative_mining
+    
+    if hnm_config.enabled:
+        # Phase-2: Weighted MIRL with Hard Negative Mining
+        mirl_loss_fn = WeightedMIRLLoss(margin=0.2, lambda_reject=0.1)
+        hard_negative_miner = HardNegativeMiner(hnm_config)
+        
+        print(f"\n✓ Hard Negative Mining: ENABLED (Phase-2)")
+        print(f"    Difficulty weights: IoU={hnm_config.weight_iou}, pose={hnm_config.weight_pose}, size={hnm_config.weight_size}")
+        if hnm_config.curriculum_enabled:
+            print(f"    Curriculum: {hnm_config.curriculum_start_ratio:.0%} → {hnm_config.curriculum_end_ratio:.0%} over {hnm_config.curriculum_warmup_epochs} warmup epochs")
+        else:
+            print(f"    Curriculum: DISABLED (fixed hard ratio)")
+        print(f"    Top-K hard negatives: {hnm_config.top_k_hard}")
+        print(f"    Hard negative weight: {hnm_config.hard_negative_weight}x")
+        print(f"✓ WeightedMIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
+    else:
+        # Phase-1 / Baseline: Standard MIRL (no hard negative mining)
+        mirl_loss_fn = MIRLLoss(margin=0.2, lambda_reject=0.1)
+        hard_negative_miner = None
+        
+        print(f"\n✓ Hard Negative Mining: DISABLED (Phase-1 / baseline)")
+        print(f"✓ MIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
     
     # =========================================================================
     # DATASET SETUP
@@ -936,6 +963,12 @@ def _run_training_loop(
         
         train_metrics_computer = MetricsComputer()
         epoch_losses = []
+        epoch_hardness_scores = []  # Phase-2: Track average hardness for debugging
+        
+        # Phase-2: Get current hard negative ratio from curriculum
+        if hard_negative_miner is not None:
+            current_hard_ratio = hard_negative_miner.get_hard_ratio(epoch, num_epochs)
+            print(f"  [Phase-2] Current hard negative ratio: {current_hard_ratio:.1%}")
         
         pbar = tqdm(train_dataloader, desc=f"Training Epoch {epoch+1}")
         
@@ -965,8 +998,26 @@ def _run_training_loop(
             grounded_tokens = adapter(visual_embeddings, query_embeddings)
             scores = scorer(grounded_tokens, query_embeddings)
             
-            # Compute loss
-            loss_dict = mirl_loss_fn(scores, gt_indices, valid)
+            # Compute loss (Phase-2: with optional hard negative weights)
+            if hard_negative_miner is not None:
+                # Compute difficulty-aware weights for negatives
+                negative_weights, weight_stats = hard_negative_miner.compute_negative_weights(
+                    boxes=boxes,
+                    keypoints=keypoints,
+                    gt_indices=gt_indices,
+                    valid=valid,
+                    epoch=epoch,
+                    max_epochs=num_epochs,
+                )
+                loss_dict = mirl_loss_fn(scores, gt_indices, valid, negative_weights=negative_weights)
+                
+                # Track hardness for debugging
+                if 'avg_hardness' in weight_stats:
+                    epoch_hardness_scores.append(weight_stats['avg_hardness'])
+            else:
+                # Standard MIRL (no hard negative mining)
+                loss_dict = mirl_loss_fn(scores, gt_indices, valid)
+            
             total_loss = loss_dict["total"]
             
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -1015,6 +1066,11 @@ def _run_training_loop(
         
         # Get epoch training metrics
         train_metrics = train_metrics_computer.get_accumulated_metrics()
+        
+        # Phase-2: Log hardness debug statistic
+        if hard_negative_miner is not None and len(epoch_hardness_scores) > 0:
+            avg_epoch_hardness = sum(epoch_hardness_scores) / len(epoch_hardness_scores)
+            print(f"  [Phase-2] Avg hardness of sampled negatives: {avg_epoch_hardness:.4f}")
         
         # Log training metrics
         # Note: rejection_accuracy removed - dataset contains no rejection samples

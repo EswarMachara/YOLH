@@ -129,17 +129,56 @@ class CrossAttentionConfig:
 
 
 @dataclass
+class HardNegativeMiningConfig:
+    """
+    Hard Negative Mining configuration (Phase-2).
+    
+    Controls difficulty-aware negative sampling to improve discrimination
+    between visually similar humans.
+    """
+    # Master switch - when False, behaves like Phase-1
+    enabled: bool = False
+    
+    # Difficulty score weights (must sum to 1.0)
+    weight_iou: float = 0.5      # IoU overlap with GT
+    weight_pose: float = 0.3     # Keypoint similarity
+    weight_size: float = 0.2     # Bounding box size similarity
+    
+    # Curriculum scheduling
+    curriculum_enabled: bool = True
+    curriculum_start_ratio: float = 0.3   # Hard negative ratio at epoch 0
+    curriculum_end_ratio: float = 0.9     # Hard negative ratio at final epoch
+    curriculum_warmup_epochs: int = 5     # Linear warmup period
+    
+    # Mining strategy
+    top_k_hard: int = 4          # Number of hardest negatives to focus on
+    hard_negative_weight: float = 2.0  # Extra weight for hard negatives in loss
+    
+    def __post_init__(self):
+        """Validate configuration."""
+        total_weight = self.weight_iou + self.weight_pose + self.weight_size
+        if abs(total_weight - 1.0) > 1e-6:
+            raise ValueError(
+                f"Difficulty weights must sum to 1.0, got {total_weight:.4f} "
+                f"(iou={self.weight_iou}, pose={self.weight_pose}, size={self.weight_size})"
+            )
+
+
+@dataclass
 class GroundingConfig:
     """
     Grounding adapter configuration.
     
     Controls the fusion mechanism between text query and visual tokens.
     Phase-1 improvement: cross_attention replaces film (baseline).
+    Phase-2 improvement: hard_negative_mining for better discrimination.
     """
     # Adapter type: "cross_attention" (Phase-1) or "film" (baseline)
     adapter_type: str = "cross_attention"
     # Cross-attention specific settings
     cross_attention: CrossAttentionConfig = field(default_factory=CrossAttentionConfig)
+    # Hard negative mining settings (Phase-2)
+    hard_negative_mining: HardNegativeMiningConfig = field(default_factory=HardNegativeMiningConfig)
     
     def __post_init__(self):
         """Validate adapter type."""
@@ -370,9 +409,15 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
             ca_config = CrossAttentionConfig(**grounding_raw["cross_attention"])
         else:
             ca_config = CrossAttentionConfig()
+        # Parse hard_negative_mining nested config if present (Phase-2)
+        if "hard_negative_mining" in grounding_raw and grounding_raw["hard_negative_mining"] is not None:
+            hnm_config = HardNegativeMiningConfig(**grounding_raw["hard_negative_mining"])
+        else:
+            hnm_config = HardNegativeMiningConfig()
         grounding_config = GroundingConfig(
             adapter_type=grounding_raw.get("adapter_type", "cross_attention"),
             cross_attention=ca_config,
+            hard_negative_mining=hnm_config,
         )
     else:
         grounding_config = GroundingConfig()  # Use defaults

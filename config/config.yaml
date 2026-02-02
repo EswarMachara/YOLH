@@ -110,6 +110,28 @@ grounding:
     dim_feedforward: 512
     # Dropout rate (0.0 for deterministic)
     dropout: 0.1
+  
+  # ==========================================================================
+  # HARD NEGATIVE MINING (Phase-2)
+  # ==========================================================================
+  # Difficulty-aware negative sampling to improve discrimination
+  # Set enabled: true to activate Phase-2 improvements
+  hard_negative_mining:
+    # Master switch - set to true for Phase-2 experiments
+    enabled: false
+    # Difficulty score weights (must sum to 1.0)
+    # Higher weight = more influence on difficulty score
+    weight_iou: 0.5      # IoU overlap with GT (spatial proximity)
+    weight_pose: 0.3     # Keypoint similarity (pose similarity)
+    weight_size: 0.2     # Bounding box size similarity
+    # Curriculum scheduling - gradually increase hard negative focus
+    curriculum_enabled: true
+    curriculum_start_ratio: 0.3   # Start with 30% hard negatives
+    curriculum_end_ratio: 0.9     # End with 90% hard negatives
+    curriculum_warmup_epochs: 5   # Linear warmup over 5 epochs
+    # Mining strategy
+    top_k_hard: 4                 # Focus on top-4 hardest negatives
+    hard_negative_weight: 2.0     # Extra loss weight for hard negatives
 
 # =============================================================================
 # OUTPUTS CONFIGURATION
