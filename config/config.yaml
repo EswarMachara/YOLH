@@ -49,7 +49,7 @@ training:
   # Device: "cuda" for GPU, "cpu" for CPU-only
   device: cuda
   # Batch size for training
-  batch_size: 16
+  batch_size: 32
   # Number of training epochs
   num_epochs: 50
   # DataLoader workers (0 for main thread)
