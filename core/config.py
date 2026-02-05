@@ -165,6 +165,30 @@ class HardNegativeMiningConfig:
 
 
 @dataclass
+class TextEncoderConfig:
+    """
+    Text encoder configuration for token-level grounding.
+    
+    Controls tokenization behavior for Phase-3.
+    """
+    max_length: int = 64  # Maximum token sequence length
+
+
+@dataclass
+class TextVisualAlignmentConfig:
+    """
+    Text-Visual Alignment adapter configuration (Phase-3).
+    
+    Token-level cross-modal attention for fine-grained grounding.
+    """
+    num_heads: int = 4
+    num_layers: int = 1
+    dim_feedforward: int = 512
+    dropout: float = 0.1
+    bidirectional: bool = True  # Enable visual→text refinement
+
+
+@dataclass
 class GroundingConfig:
     """
     Grounding adapter configuration.
@@ -172,22 +196,72 @@ class GroundingConfig:
     Controls the fusion mechanism between text query and visual tokens.
     Phase-1 improvement: cross_attention replaces film (baseline).
     Phase-2 improvement: hard_negative_mining for better discrimination.
+    Phase-3 improvement: text_visual_alignment for token-level grounding.
+    
+    EXPERIMENT MODES:
+        - "phase1": Cross-attention adapter (sentence-level)
+        - "phase2": Cross-attention + hard negative mining
+        - "phase3": Text-visual alignment (token-level)
+        - "phase3_hnm": Text-visual alignment + hard negative mining
+        - None: Manual configuration (use adapter_type and hard_negative_mining.enabled directly)
     """
-    # Adapter type: "cross_attention" (Phase-1) or "film" (baseline)
+    # Experiment mode - master switch that overrides adapter_type and HNM
+    # Options: None, "phase1", "phase2", "phase3", "phase3_hnm"
+    experiment_mode: Optional[str] = None
+    
+    # Adapter type: "cross_attention" (Phase-1), "film" (baseline), or "text_visual_alignment" (Phase-3)
     adapter_type: str = "cross_attention"
-    # Cross-attention specific settings
+    # Text encoder settings (for token-level grounding)
+    text_encoder: TextEncoderConfig = field(default_factory=TextEncoderConfig)
+    # Cross-attention specific settings (Phase-1)
     cross_attention: CrossAttentionConfig = field(default_factory=CrossAttentionConfig)
+    # Text-visual alignment settings (Phase-3)
+    text_visual_alignment: TextVisualAlignmentConfig = field(default_factory=TextVisualAlignmentConfig)
     # Hard negative mining settings (Phase-2)
     hard_negative_mining: HardNegativeMiningConfig = field(default_factory=HardNegativeMiningConfig)
     
     def __post_init__(self):
-        """Validate adapter type."""
-        valid_types = ["cross_attention", "film"]
+        """Validate and resolve experiment mode."""
+        valid_types = ["cross_attention", "film", "text_visual_alignment"]
+        valid_modes = [None, "phase1", "phase2", "phase3", "phase3_hnm"]
+        
+        # Validate experiment_mode if set
+        if self.experiment_mode is not None and self.experiment_mode not in valid_modes:
+            raise ValueError(
+                f"Invalid experiment_mode: '{self.experiment_mode}'. "
+                f"Must be one of: {valid_modes}"
+            )
+        
+        # Validate adapter_type
         if self.adapter_type not in valid_types:
             raise ValueError(
                 f"Invalid adapter_type: '{self.adapter_type}'. "
                 f"Must be one of: {valid_types}"
             )
+    
+    def resolve_experiment_mode(self) -> tuple:
+        """
+        Resolve experiment mode to concrete settings.
+        
+        Returns:
+            (adapter_type, hnm_enabled, mode_description)
+        """
+        if self.experiment_mode is None:
+            # Manual mode - use explicit settings
+            return (
+                self.adapter_type,
+                self.hard_negative_mining.enabled,
+                f"Manual ({self.adapter_type}, HNM={'ON' if self.hard_negative_mining.enabled else 'OFF'})"
+            )
+        
+        mode_mapping = {
+            "phase1": ("cross_attention", False, "Phase-1 (Cross-Attention)"),
+            "phase2": ("cross_attention", True, "Phase-2 (Cross-Attention + Hard Negative Mining)"),
+            "phase3": ("text_visual_alignment", False, "Phase-3 (Text-Visual Token Alignment)"),
+            "phase3_hnm": ("text_visual_alignment", True, "Phase-3 + Phase-2 (Token Alignment + HNM)"),
+        }
+        
+        return mode_mapping[self.experiment_mode]
 
 
 @dataclass
@@ -404,19 +478,32 @@ def load_config(config_path: str, project_root: Optional[Path] = None) -> Config
     # Handle optional grounding section (with defaults)
     if "grounding" in raw and raw["grounding"] is not None:
         grounding_raw = raw["grounding"]
-        # Parse cross_attention nested config if present
+        # Parse cross_attention nested config if present (Phase-1)
         if "cross_attention" in grounding_raw and grounding_raw["cross_attention"] is not None:
             ca_config = CrossAttentionConfig(**grounding_raw["cross_attention"])
         else:
             ca_config = CrossAttentionConfig()
+        # Parse text_visual_alignment nested config if present (Phase-3)
+        if "text_visual_alignment" in grounding_raw and grounding_raw["text_visual_alignment"] is not None:
+            tva_config = TextVisualAlignmentConfig(**grounding_raw["text_visual_alignment"])
+        else:
+            tva_config = TextVisualAlignmentConfig()
         # Parse hard_negative_mining nested config if present (Phase-2)
         if "hard_negative_mining" in grounding_raw and grounding_raw["hard_negative_mining"] is not None:
             hnm_config = HardNegativeMiningConfig(**grounding_raw["hard_negative_mining"])
         else:
             hnm_config = HardNegativeMiningConfig()
+        # Parse text_encoder nested config if present
+        if "text_encoder" in grounding_raw and grounding_raw["text_encoder"] is not None:
+            te_config = TextEncoderConfig(**grounding_raw["text_encoder"])
+        else:
+            te_config = TextEncoderConfig()
         grounding_config = GroundingConfig(
+            experiment_mode=grounding_raw.get("experiment_mode", None),
             adapter_type=grounding_raw.get("adapter_type", "cross_attention"),
+            text_encoder=te_config,
             cross_attention=ca_config,
+            text_visual_alignment=tva_config,
             hard_negative_mining=hnm_config,
         )
     else:

@@ -352,13 +352,18 @@ def create_grounding_adapter(
     Factory function to create grounding adapter.
     
     Args:
-        adapter_type: "cross_attention" or "film" (for backward compatibility)
+        adapter_type: "cross_attention", "film", or "text_visual_alignment"
         token_dim: Token dimension
         query_dim: Query dimension
         **kwargs: Additional arguments for specific adapter types
     
     Returns:
         Adapter module
+    
+    Supported adapter types:
+        - "film": FiLM-style modulation (Phase-0 baseline)
+        - "cross_attention": Query-to-human cross-attention (Phase-1)
+        - "text_visual_alignment": Token-level cross-modal attention (Phase-3)
     """
     if adapter_type == "cross_attention":
         return CrossAttentionAdapter(
@@ -369,12 +374,26 @@ def create_grounding_adapter(
             dim_feedforward=kwargs.get("dim_feedforward", 512),
             dropout=kwargs.get("dropout", 0.1),
         )
+    elif adapter_type == "text_visual_alignment":
+        # Phase-3: Token-level cross-modal alignment
+        from adapter.text_visual_alignment_adapter import TextVisualAlignmentAdapter
+        return TextVisualAlignmentAdapter(
+            token_dim=token_dim,
+            num_heads=kwargs.get("num_heads", 4),
+            num_layers=kwargs.get("num_layers", 1),
+            dim_feedforward=kwargs.get("dim_feedforward", 512),
+            dropout=kwargs.get("dropout", 0.1),
+            bidirectional=kwargs.get("bidirectional", True),
+        )
     elif adapter_type == "film":
         # Import the original FiLM adapter for backward compatibility
         from training.grounding_train_v2 import TrainableAdapter
         return TrainableAdapter(token_dim=token_dim, query_dim=query_dim)
     else:
-        raise ValueError(f"Unknown adapter type: {adapter_type}. Choose 'cross_attention' or 'film'.")
+        raise ValueError(
+            f"Unknown adapter type: {adapter_type}. "
+            f"Choose 'cross_attention', 'text_visual_alignment', or 'film'."
+        )
 
 
 # =============================================================================

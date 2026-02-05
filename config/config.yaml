@@ -98,9 +98,36 @@ splits:
 # =============================================================================
 # Controls the fusion mechanism between text query and visual tokens
 grounding:
-  # Adapter type: "cross_attention" (Phase-1 improvement) or "film" (baseline)
+  # ==========================================================================
+  # EXPERIMENT MODE (MASTER SWITCH)
+  # ==========================================================================
+  # Use this to quickly switch between experiment configurations.
+  # When set, this OVERRIDES adapter_type and hard_negative_mining.enabled
+  # Options:
+  #   null     - Manual mode (use adapter_type and HNM settings directly)
+  #   "phase1" - Cross-attention adapter only
+  #   "phase2" - Cross-attention + hard negative mining
+  #   "phase3" - Text-visual token alignment only
+  #   "phase3_hnm" - Text-visual alignment + hard negative mining
+  experiment_mode: null
+  
+  # Adapter type (used when experiment_mode is null):
+  #   "film" - FiLM baseline (Phase-0)
+  #   "cross_attention" - Cross-attention (Phase-1)
+  #   "text_visual_alignment" - Token-level alignment (Phase-3)
   adapter_type: cross_attention
-  # Cross-attention specific settings (ignored if adapter_type=film)
+  
+  # ==========================================================================
+  # TEXT ENCODER SETTINGS
+  # ==========================================================================
+  # Controls tokenization for caption encoding
+  text_encoder:
+    # Maximum token sequence length (affects Phase-3 token-level grounding)
+    # Recommended: >= 32 to avoid truncating spatial/attribute descriptions
+    max_length: 64
+  
+  # Cross-attention specific settings (Phase-1)
+  # Ignored if adapter_type != "cross_attention"
   cross_attention:
     # Number of attention heads (4 or 8)
     num_heads: 4
@@ -112,13 +139,31 @@ grounding:
     dropout: 0.1
   
   # ==========================================================================
+  # TEXT-VISUAL ALIGNMENT (Phase-3)
+  # ==========================================================================
+  # Token-level cross-modal attention for fine-grained grounding
+  # Replaces sentence-level embeddings with word-level alignment
+  # Set adapter_type: text_visual_alignment to activate
+  text_visual_alignment:
+    # Number of attention heads
+    num_heads: 4
+    # Number of cross-attention layers
+    num_layers: 1
+    # FFN hidden dimension
+    dim_feedforward: 512
+    # Dropout rate
+    dropout: 0.1
+    # Enable bidirectional refinement (visual→text→visual)
+    bidirectional: true
+  
+  # ==========================================================================
   # HARD NEGATIVE MINING (Phase-2)
   # ==========================================================================
   # Difficulty-aware negative sampling to improve discrimination
   # Set enabled: true to activate Phase-2 improvements
   hard_negative_mining:
     # Master switch - set to true for Phase-2 experiments
-    enabled: true
+    enabled: false
     # Difficulty score weights (must sum to 1.0)
     # Higher weight = more influence on difficulty score
     weight_iou: 0.5      # IoU overlap with GT (spatial proximity)

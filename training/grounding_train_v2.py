@@ -163,16 +163,23 @@ class SimpleQueryEncoder(nn.Module):
     """
     Query encoder using sentence-transformers/all-MiniLM-L6-v2.
     Outputs 256D embeddings (projected from 384D).
+    
+    Supports two modes:
+    - Sentence-level: forward/forward_batch → [B, 256]
+    - Token-level (Phase-3): forward_tokens_batch → [B, T, 256]
     """
     
-    def __init__(self):
+    def __init__(self, max_length: int = 64):
         super().__init__()
         from transformers import AutoTokenizer, AutoModel
+        
+        self.max_length = max_length  # Configurable token length
         
         self.tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
         self.model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
         self.model.eval()
         
+        # Sentence-level projection (384 → 256)
         if D_QUERY != 384:
             self.projection = nn.Linear(384, D_QUERY, bias=False)
             torch.manual_seed(42)
@@ -182,6 +189,15 @@ class SimpleQueryEncoder(nn.Module):
                 p.requires_grad = False
         else:
             self.projection = None
+        
+        # Token-level projection (Phase-3: 384 → 256 per token)
+        # Separate from sentence projection for clarity
+        self.token_projection = nn.Linear(384, D_QUERY, bias=False)
+        torch.manual_seed(43)  # Different seed for token projection
+        nn.init.orthogonal_(self.token_projection.weight)
+        self.token_projection.eval()
+        for p in self.token_projection.parameters():
+            p.requires_grad = False
     
     def _get_device(self) -> torch.device:
         return next(self.model.parameters()).device
@@ -201,7 +217,7 @@ class SimpleQueryEncoder(nn.Module):
                 text, 
                 padding=True, 
                 truncation=True, 
-                max_length=128, 
+                max_length=self.max_length, 
                 return_tensors='pt'
             )
             encoded = {k: v.to(device) for k, v in encoded.items()}
@@ -223,7 +239,7 @@ class SimpleQueryEncoder(nn.Module):
                 texts, 
                 padding=True, 
                 truncation=True, 
-                max_length=128, 
+                max_length=self.max_length, 
                 return_tensors='pt'
             )
             encoded = {k: v.to(device) for k, v in encoded.items()}
@@ -236,6 +252,46 @@ class SimpleQueryEncoder(nn.Module):
                 embeddings = self.projection(embeddings)
         
         return embeddings
+    
+    def forward_tokens_batch(
+        self, 
+        texts: List[str]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Phase-3: Extract token-level embeddings instead of sentence pooling.
+        
+        Args:
+            texts: List of caption strings [B]
+        
+        Returns:
+            token_embeddings: [B, T, D_QUERY] - Token embeddings projected to 256D
+            attention_mask: [B, T] - Boolean mask (True = valid token, False = padding)
+        """
+        device = self._get_device()
+        
+        with torch.no_grad():
+            # Tokenize with padding (uses configurable max_length)
+            encoded = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            
+            # Get last hidden states from transformer
+            # model_output[0] = last_hidden_state [B, T, 384]
+            model_output = self.model(**encoded)
+            token_embeddings = model_output[0]  # [B, T, 384]
+            
+            # Project each token to D_QUERY (256)
+            token_embeddings = self.token_projection(token_embeddings)  # [B, T, 256]
+            
+            # Get attention mask (True = valid, False = padding)
+            attention_mask = encoded['attention_mask'].bool()  # [B, T]
+        
+        return token_embeddings, attention_mask
 
 
 class MIRLLoss(nn.Module):
@@ -649,6 +705,7 @@ def validate_epoch(
     mirl_loss_fn: nn.Module,
     val_dataloader: DataLoader,
     device: str,
+    use_token_level_alignment: bool = False,
 ) -> GroundingMetrics:
     """
     Run validation loop and compute all metrics.
@@ -660,6 +717,7 @@ def validate_epoch(
         mirl_loss_fn: MIRL loss function
         val_dataloader: Validation data loader
         device: Device string
+        use_token_level_alignment: If True, use Phase-3 token-level encoding
     
     Returns:
         GroundingMetrics for validation set
@@ -685,10 +743,23 @@ def validate_epoch(
         if B == 0 or N == 0:
             continue
         
-        # Forward pass
-        query_embeddings = query_encoder.forward_batch(captions)
-        grounded_tokens = adapter(visual_embeddings, query_embeddings)
-        scores = scorer(grounded_tokens, query_embeddings)
+        # Forward pass - encode captions
+        with torch.no_grad():
+            if use_token_level_alignment:
+                # Phase-3: Token-level embeddings
+                caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
+                query_embeddings = query_encoder.forward_batch(captions)
+            else:
+                query_embeddings = query_encoder.forward_batch(captions)
+        
+        # Forward pass - adapter
+        with torch.no_grad():
+            if use_token_level_alignment:
+                grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
+            else:
+                grounded_tokens = adapter(visual_embeddings, query_embeddings)
+            
+            scores = scorer(grounded_tokens, query_embeddings)
         
         # Compute loss
         loss_dict = mirl_loss_fn(scores, gt_indices, valid)
@@ -738,18 +809,35 @@ def _run_training_loop(
     print("Initializing model components (NO YOLO)")
     print("-" * 50)
     
-    query_encoder = SimpleQueryEncoder()
+    # ==========================================================================
+    # EXPERIMENT MODE RESOLUTION
+    # ==========================================================================
+    resolved_adapter_type, resolved_hnm_enabled, mode_description = config.grounding.resolve_experiment_mode()
+    
+    print(f"\n{'='*50}")
+    print(f"EXPERIMENT MODE: {mode_description}")
+    print(f"{'='*50}")
+    print(f"  Resolved adapter_type: {resolved_adapter_type}")
+    print(f"  Resolved HNM enabled: {resolved_hnm_enabled}")
+    print(f"  Text encoder max_length: {config.grounding.text_encoder.max_length}")
+    
+    query_encoder = SimpleQueryEncoder(
+        max_length=config.grounding.text_encoder.max_length
+    )
     query_encoder.to(device)
     query_encoder.eval()
     for param in query_encoder.parameters():
         param.requires_grad = False
-    print(f"✓ SimpleQueryEncoder loaded (frozen)")
+    print(f"✓ SimpleQueryEncoder loaded (frozen, max_length={config.grounding.text_encoder.max_length})")
     
     # ==========================================================================
-    # ADAPTER SELECTION (Phase-1: cross_attention vs film baseline)
+    # ADAPTER SELECTION (Phase-0/1/3: film, cross_attention, text_visual_alignment)
     # ==========================================================================
-    adapter_type = config.grounding.adapter_type
-    print(f"\n  Adapter type from config: {adapter_type}")
+    adapter_type = resolved_adapter_type
+    print(f"\n  Adapter type: {adapter_type}")
+    
+    # Track if we're using token-level alignment (affects forward pass)
+    use_token_level_alignment = False
     
     if adapter_type == "cross_attention":
         # Phase-1 improvement: Cross-Attention based grounding
@@ -768,10 +856,31 @@ def _run_training_loop(
         print(f"    num_layers: {ca_config.num_layers}")
         print(f"    dim_feedforward: {ca_config.dim_feedforward}")
         print(f"    dropout: {ca_config.dropout}")
+    elif adapter_type == "text_visual_alignment":
+        # Phase-3: Token-level cross-modal alignment
+        tva_config = config.grounding.text_visual_alignment
+        adapter = create_grounding_adapter(
+            adapter_type="text_visual_alignment",
+            token_dim=D_TOKEN,
+            query_dim=D_QUERY,
+            num_heads=tva_config.num_heads,
+            num_layers=tva_config.num_layers,
+            dim_feedforward=tva_config.dim_feedforward,
+            dropout=tva_config.dropout,
+            bidirectional=tva_config.bidirectional,
+        )
+        use_token_level_alignment = True
+        print(f"✓ TextVisualAlignmentAdapter initialized (Phase-3, trainable)")
+        print(f"    num_heads: {tva_config.num_heads}")
+        print(f"    num_layers: {tva_config.num_layers}")
+        print(f"    dim_feedforward: {tva_config.dim_feedforward}")
+        print(f"    dropout: {tva_config.dropout}")
+        print(f"    bidirectional: {tva_config.bidirectional}")
+        print(f"✓ Token-level cross-attention active (max_length={config.grounding.text_encoder.max_length})")
     else:
-        # Baseline: FiLM-style adapter
+        # Baseline: FiLM-style adapter (Phase-0)
         adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
-        print(f"✓ TrainableAdapter (FiLM) initialized (trainable)")
+        print(f"✓ TrainableAdapter (FiLM) initialized (Phase-0 baseline, trainable)")
     
     adapter.to(device)
     adapter.train()
@@ -789,13 +898,15 @@ def _run_training_loop(
     # LOSS FUNCTION SELECTION (Phase-2: Hard Negative Mining)
     # ==========================================================================
     hnm_config = config.grounding.hard_negative_mining
+    # Use resolved HNM setting (from experiment_mode or direct config)
+    hnm_enabled = resolved_hnm_enabled
     
-    if hnm_config.enabled:
+    if hnm_enabled:
         # Phase-2: Weighted MIRL with Hard Negative Mining
         mirl_loss_fn = WeightedMIRLLoss(margin=0.2, lambda_reject=0.1)
         hard_negative_miner = HardNegativeMiner(hnm_config)
         
-        print(f"\n✓ Hard Negative Mining: ENABLED (Phase-2)")
+        print(f"\n✓ Hard Negative Mining: ENABLED")
         print(f"    Difficulty weights: IoU={hnm_config.weight_iou}, pose={hnm_config.weight_pose}, size={hnm_config.weight_size}")
         if hnm_config.curriculum_enabled:
             print(f"    Curriculum: {hnm_config.curriculum_start_ratio:.0%} → {hnm_config.curriculum_end_ratio:.0%} over {hnm_config.curriculum_warmup_epochs} warmup epochs")
@@ -805,11 +916,11 @@ def _run_training_loop(
         print(f"    Hard negative weight: {hnm_config.hard_negative_weight}x")
         print(f"✓ WeightedMIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
     else:
-        # Phase-1 / Baseline: Standard MIRL (no hard negative mining)
+        # Standard MIRL (no hard negative mining)
         mirl_loss_fn = MIRLLoss(margin=0.2, lambda_reject=0.1)
         hard_negative_miner = None
         
-        print(f"\n✓ Hard Negative Mining: DISABLED (Phase-1 / baseline)")
+        print(f"\n✓ Hard Negative Mining: DISABLED")
         print(f"✓ MIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
     
     # =========================================================================
@@ -964,6 +1075,7 @@ def _run_training_loop(
         train_metrics_computer = MetricsComputer()
         epoch_losses = []
         epoch_hardness_scores = []  # Phase-2: Track average hardness for debugging
+        epoch_caption_lengths = []  # Phase-3: Track caption token lengths
         
         # Phase-2: Get current hard negative ratio from curriculum
         if hard_negative_miner is not None:
@@ -991,11 +1103,30 @@ def _run_training_loop(
             if B == 0 or N == 0:
                 continue
             
-            # Forward pass
+            # Forward pass - encode captions
             with torch.no_grad():
-                query_embeddings = query_encoder.forward_batch(captions)
+                if use_token_level_alignment:
+                    # Phase-3: Token-level embeddings [B, T, 256] + mask [B, T]
+                    caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
+                    # Also get sentence-level for scorer (still uses pooled query)
+                    query_embeddings = query_encoder.forward_batch(captions)
+                    
+                    # Phase-3 diagnostic: track actual caption token lengths
+                    actual_lengths = caption_mask.sum(dim=1).tolist()  # [B]
+                    epoch_caption_lengths.extend(actual_lengths)
+                else:
+                    # Phase-0/1: Sentence-level embedding [B, 256]
+                    query_embeddings = query_encoder.forward_batch(captions)
             
-            grounded_tokens = adapter(visual_embeddings, query_embeddings)
+            # Forward pass - adapter
+            if use_token_level_alignment:
+                # Phase-3: Token-level cross-modal alignment
+                grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
+            else:
+                # Phase-0/1: Sentence-level grounding
+                grounded_tokens = adapter(visual_embeddings, query_embeddings)
+            
+            # Forward pass - scorer (always uses sentence-level query)
             scores = scorer(grounded_tokens, query_embeddings)
             
             # Compute loss (Phase-2: with optional hard negative weights)
@@ -1072,6 +1203,15 @@ def _run_training_loop(
             avg_epoch_hardness = sum(epoch_hardness_scores) / len(epoch_hardness_scores)
             print(f"  [Phase-2] Avg hardness of sampled negatives: {avg_epoch_hardness:.4f}")
         
+        # Phase-3: Log caption length statistics
+        if use_token_level_alignment and len(epoch_caption_lengths) > 0:
+            avg_len = sum(epoch_caption_lengths) / len(epoch_caption_lengths)
+            max_len = max(epoch_caption_lengths)
+            min_len = min(epoch_caption_lengths)
+            print(f"  [Phase-3] Caption token lengths: avg={avg_len:.1f}, min={min_len}, max={max_len}")
+            if max_len >= config.grounding.text_encoder.max_length:
+                print(f"  [Phase-3] ⚠️ Some captions hit max_length={config.grounding.text_encoder.max_length} (may be truncated)")
+        
         # Log training metrics
         # Note: rejection_accuracy removed - dataset contains no rejection samples
         train_logger.log({
@@ -1098,6 +1238,7 @@ def _run_training_loop(
             mirl_loss_fn=mirl_loss_fn,
             val_dataloader=val_dataloader,
             device=device,
+            use_token_level_alignment=use_token_level_alignment,
         )
         
         # Log validation metrics
