@@ -109,7 +109,7 @@ grounding:
   #   "phase2" - Cross-attention + hard negative mining
   #   "phase3" - Text-visual token alignment only
   #   "phase3_hnm" - Text-visual alignment + hard negative mining
-  experiment_mode: null
+  experiment_mode: phase3
   
   # Adapter type (used when experiment_mode is null):
   #   "film" - FiLM baseline (Phase-0)

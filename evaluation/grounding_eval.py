@@ -47,6 +47,7 @@ from training.grounding_train_v2 import (
     collate_variable_humans,
 )
 from adapter.cross_attention_adapter import CrossAttentionAdapter, create_grounding_adapter
+from adapter.text_visual_alignment_adapter import TextVisualAlignmentAdapter
 
 
 def load_checkpoint(checkpoint_path: Path, device: str) -> Dict:
@@ -90,6 +91,7 @@ def evaluate_test_split(
     mirl_loss_fn: nn.Module,
     test_dataloader: DataLoader,
     device: str,
+    use_token_level_alignment: bool = False,
 ) -> GroundingMetrics:
     """
     Evaluate on TEST split and compute all metrics.
@@ -101,6 +103,7 @@ def evaluate_test_split(
         mirl_loss_fn: MIRL loss function
         test_dataloader: Test data loader
         device: Device string
+        use_token_level_alignment: If True, use Phase-3 token-level alignment
     
     Returns:
         GroundingMetrics for test set
@@ -128,9 +131,20 @@ def evaluate_test_split(
         if B == 0 or N == 0:
             continue
         
-        # Forward pass
-        query_embeddings = query_encoder.forward_batch(captions)
-        grounded_tokens = adapter(visual_embeddings, query_embeddings)
+        # Forward pass - encode captions
+        if use_token_level_alignment:
+            # Phase-3: Token-level embeddings [B, T, 256] + mask [B, T]
+            caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
+            # Also get sentence-level for scorer
+            query_embeddings = query_encoder.forward_batch(captions)
+            # Phase-3: Token-level cross-modal alignment
+            grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
+        else:
+            # Phase-0/1: Sentence-level embedding [B, 256]
+            query_embeddings = query_encoder.forward_batch(captions)
+            grounded_tokens = adapter(visual_embeddings, query_embeddings)
+        
+        # Forward pass - scorer (always uses sentence-level query)
         scores = scorer(grounded_tokens, query_embeddings)
         
         # Compute loss
@@ -235,30 +249,25 @@ def print_final_summary(metrics: GroundingMetrics, checkpoint_path: Path):
     print(f"  {'='*50}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate grounding model on TEST split")
-    add_config_argument(parser)
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to checkpoint (default: checkpoints/best_model.pt)"
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Batch size for evaluation (default: from config)"
-    )
-    args = parser.parse_args()
+def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size: Optional[int] = None) -> GroundingMetrics:
+    """
+    Evaluate grounding model on TEST split.
     
+    This function can be called directly from notebooks with an in-memory config object,
+    avoiding the need to reload config from disk.
+    
+    Args:
+        config: Configuration object (can be modified in-memory)
+        checkpoint_path: Path to checkpoint (default: config.checkpoint_dir / "best_model.pt")
+        batch_size: Batch size for evaluation (default: from config)
+    
+    Returns:
+        GroundingMetrics for test set
+    """
     print("=" * 70)
     print("GROUNDING MODEL EVALUATION - TEST SPLIT")
     print("=" * 70)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Load config
-    config = load_config(args.config)
     
     # Determine device
     device = config.training.device
@@ -269,9 +278,7 @@ def main():
     print(f"\nDevice: {device}")
     
     # Determine checkpoint path
-    if args.checkpoint:
-        checkpoint_path = Path(args.checkpoint)
-    else:
+    if checkpoint_path is None:
         checkpoint_path = config.checkpoint_dir / "best_model.pt"
     
     # Load checkpoint
@@ -280,14 +287,33 @@ def main():
     # Initialize models
     print("\nInitializing models...")
     
-    query_encoder = SimpleQueryEncoder()
+    # Resolve experiment mode to get correct adapter type
+    resolved_adapter_type, resolved_hnm_enabled, mode_description = config.grounding.resolve_experiment_mode()
+    use_token_level_alignment = (resolved_adapter_type == "text_visual_alignment")
+    
+    print(f"\n🎛️  Experiment Mode: {mode_description}")
+    print(f"    Adapter type: {resolved_adapter_type}")
+    print(f"    Token-level alignment: {use_token_level_alignment}")
+    
+    query_encoder = SimpleQueryEncoder(max_length=config.grounding.text_encoder.max_length)
     query_encoder.to(device)
     query_encoder.eval()
     print("✓ Query encoder loaded")
     
-    # Create adapter based on config (must match training configuration)
-    adapter_type = config.grounding.adapter_type
-    if adapter_type == "cross_attention":
+    # Create adapter based on resolved experiment mode (must match training configuration)
+    if resolved_adapter_type == "text_visual_alignment":
+        # Phase-3: TextVisualAlignmentAdapter
+        tva_config = config.grounding.text_visual_alignment
+        adapter = TextVisualAlignmentAdapter(
+            token_dim=D_TOKEN,
+            num_heads=tva_config.num_heads,
+            num_layers=tva_config.num_layers,
+            dim_feedforward=tva_config.dim_feedforward,
+            dropout=tva_config.dropout,
+            bidirectional=tva_config.bidirectional,
+        )
+        print(f"✓ TextVisualAlignmentAdapter created (Phase-3)")
+    elif resolved_adapter_type == "cross_attention":
         ca_config = config.grounding.cross_attention
         adapter = create_grounding_adapter(
             adapter_type="cross_attention",
@@ -324,7 +350,7 @@ def main():
     
     if not cache_dir.exists():
         print(f"\n❌ ABORT: Cache directory not found: {cache_dir}")
-        sys.exit(1)
+        raise FileNotFoundError(f"Cache directory not found: {cache_dir}")
     
     split_config = {
         'train': config.splits.train,
@@ -342,11 +368,11 @@ def main():
         seed=config.runtime.seed,
     )
     
-    batch_size = args.batch_size or config.training.batch_size
+    eval_batch_size = batch_size or config.training.batch_size
     
     test_dataloader = DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=0,
         collate_fn=collate_variable_humans,
@@ -363,6 +389,7 @@ def main():
         mirl_loss_fn=mirl_loss_fn,
         test_dataloader=test_dataloader,
         device=device,
+        use_token_level_alignment=use_token_level_alignment,
     )
     
     # Save results
@@ -377,6 +404,33 @@ def main():
     print(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     return metrics
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate grounding model on TEST split")
+    add_config_argument(parser)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint (default: checkpoints/best_model.pt)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size for evaluation (default: from config)"
+    )
+    args = parser.parse_args()
+    
+    # Load config from file
+    config = load_config(args.config)
+    
+    # Determine checkpoint path
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
+    
+    # Call the evaluate function
+    return evaluate(config, checkpoint_path, args.batch_size)
 
 
 if __name__ == "__main__":
