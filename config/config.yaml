@@ -120,10 +120,13 @@ grounding:
   # ==========================================================================
   # TEXT ENCODER SETTINGS
   # ==========================================================================
-  # Controls tokenization for caption encoding
+  # Controls text encoder model and tokenization
   text_encoder:
+    # Model type: "minilm" (baseline, 384D) or "clip" (improved, 512D)
+    # CLIP is trained for vision-language alignment and provides better embeddings
+    model_type: clip
     # Maximum token sequence length (affects Phase-3 token-level grounding)
-    # Recommended: >= 32 to avoid truncating spatial/attribute descriptions
+    # CLIP max is 77 tokens. Recommended: >= 32 to avoid truncating descriptions
     max_length: 64
   
   # Cross-attention specific settings (Phase-1)
@@ -177,6 +180,18 @@ grounding:
     # Mining strategy
     top_k_hard: 4                 # Focus on top-4 hardest negatives
     hard_negative_weight: 2.0     # Extra loss weight for hard negatives
+
+  # ==========================================================================
+  # TRAINING AUGMENTATION
+  # ==========================================================================
+  # Feature and text augmentations to improve generalization
+  augmentation:
+    # Feature-level augmentation (applied to cached visual features)
+    feature_dropout: 0.1         # Dropout rate for visual features (0.0-0.3)
+    feature_noise_std: 0.02      # Gaussian noise std for features (0.0-0.05)
+    # Caption paraphrasing (text-side augmentation)
+    use_paraphrases: false       # Enable caption paraphrasing
+    paraphrase_prob: 0.3         # Probability of using paraphrase
 
 # =============================================================================
 # OUTPUTS CONFIGURATION

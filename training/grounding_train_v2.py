@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Literal, TYPE_CHECKING, Tuple
 from core.datatypes import D_TOKEN, D_QUERY
 from core.metrics import MetricsComputer, GroundingMetrics, format_metrics_table
 from core.logging import CSVLogger
+from core.paraphrase import CaptionParaphraser
 from adapter.cross_attention_adapter import CrossAttentionAdapter, create_grounding_adapter
 
 # Phase-2: Hard Negative Mining
@@ -292,6 +293,163 @@ class SimpleQueryEncoder(nn.Module):
             attention_mask = encoded['attention_mask'].bool()  # [B, T]
         
         return token_embeddings, attention_mask
+
+
+class CLIPQueryEncoder(nn.Module):
+    """
+    Query encoder using OpenAI CLIP text encoder.
+    
+    Uses CLIP's text transformer which is trained for vision-language alignment.
+    Outputs 256D embeddings (projected from 512D for ViT-B/32).
+    
+    Supports two modes:
+    - Sentence-level: forward/forward_batch → [B, 256]
+    - Token-level (Phase-3): forward_tokens_batch → [B, T, 256]
+    """
+    
+    def __init__(self, max_length: int = 77):  # CLIP default is 77 tokens
+        super().__init__()
+        from transformers import CLIPTokenizer, CLIPTextModel
+        
+        self.max_length = min(max_length, 77)  # CLIP max is 77
+        
+        # Load CLIP text model
+        self.tokenizer = CLIPTokenizer.from_pretrained('openai/clip-vit-base-patch32')
+        self.model = CLIPTextModel.from_pretrained('openai/clip-vit-base-patch32')
+        self.model.eval()
+        
+        # Freeze CLIP weights
+        for p in self.model.parameters():
+            p.requires_grad = False
+        
+        # CLIP ViT-B/32 text encoder outputs 512D
+        clip_dim = 512
+        
+        # Sentence-level projection (512 → 256)
+        if D_QUERY != clip_dim:
+            self.projection = nn.Linear(clip_dim, D_QUERY, bias=False)
+            torch.manual_seed(42)
+            nn.init.orthogonal_(self.projection.weight)
+            self.projection.eval()
+            for p in self.projection.parameters():
+                p.requires_grad = False
+        else:
+            self.projection = None
+        
+        # Token-level projection (Phase-3: 512 → 256 per token)
+        self.token_projection = nn.Linear(clip_dim, D_QUERY, bias=False)
+        torch.manual_seed(43)
+        nn.init.orthogonal_(self.token_projection.weight)
+        self.token_projection.eval()
+        for p in self.token_projection.parameters():
+            p.requires_grad = False
+    
+    def _get_device(self) -> torch.device:
+        return next(self.model.parameters()).device
+    
+    def forward(self, text: str) -> torch.Tensor:
+        """Single text → 256D embedding."""
+        device = self._get_device()
+        
+        with torch.no_grad():
+            encoded = self.tokenizer(
+                text, 
+                padding=True, 
+                truncation=True, 
+                max_length=self.max_length, 
+                return_tensors='pt'
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            
+            # CLIP pooler_output is the [EOS] token embedding (already pooled)
+            outputs = self.model(**encoded)
+            embedding = outputs.pooler_output  # [1, 512]
+            embedding = torch.nn.functional.normalize(embedding, p=2, dim=1).squeeze(0)
+            
+            if self.projection is not None:
+                embedding = self.projection(embedding)
+        
+        return embedding
+    
+    def forward_batch(self, texts: List[str]) -> torch.Tensor:
+        """Batch of texts → [B, 256] embeddings."""
+        device = self._get_device()
+        
+        with torch.no_grad():
+            encoded = self.tokenizer(
+                texts, 
+                padding=True, 
+                truncation=True, 
+                max_length=self.max_length, 
+                return_tensors='pt'
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            
+            outputs = self.model(**encoded)
+            embeddings = outputs.pooler_output  # [B, 512]
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            
+            if self.projection is not None:
+                embeddings = self.projection(embeddings)
+        
+        return embeddings
+    
+    def forward_tokens_batch(
+        self, 
+        texts: List[str]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Phase-3: Extract token-level embeddings.
+        
+        Args:
+            texts: List of caption strings [B]
+        
+        Returns:
+            token_embeddings: [B, T, D_QUERY] - Token embeddings projected to 256D
+            attention_mask: [B, T] - Boolean mask (True = valid token, False = padding)
+        """
+        device = self._get_device()
+        
+        with torch.no_grad():
+            encoded = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            
+            # Get last hidden states from CLIP text transformer
+            outputs = self.model(**encoded)
+            token_embeddings = outputs.last_hidden_state  # [B, T, 512]
+            
+            # Project each token to D_QUERY (256)
+            token_embeddings = self.token_projection(token_embeddings)  # [B, T, 256]
+            
+            # Get attention mask (True = valid, False = padding)
+            attention_mask = encoded['attention_mask'].bool()  # [B, T]
+        
+        return token_embeddings, attention_mask
+
+
+def create_query_encoder(model_type: str = "minilm", max_length: int = 64) -> nn.Module:
+    """
+    Factory function to create the appropriate query encoder.
+    
+    Args:
+        model_type: "minilm" (baseline) or "clip" (improved)
+        max_length: Maximum token sequence length
+    
+    Returns:
+        Query encoder module
+    """
+    if model_type == "clip":
+        print(f"    Using CLIP text encoder (openai/clip-vit-base-patch32)")
+        return CLIPQueryEncoder(max_length=min(max_length, 77))
+    else:
+        print(f"    Using MiniLM text encoder (sentence-transformers/all-MiniLM-L6-v2)")
+        return SimpleQueryEncoder(max_length=max_length)
 
 
 class MIRLLoss(nn.Module):
@@ -821,14 +979,19 @@ def _run_training_loop(
     print(f"  Resolved HNM enabled: {resolved_hnm_enabled}")
     print(f"  Text encoder max_length: {config.grounding.text_encoder.max_length}")
     
-    query_encoder = SimpleQueryEncoder(
+    # Get text encoder model type (minilm or clip)
+    text_encoder_type = getattr(config.grounding.text_encoder, 'model_type', 'minilm')
+    print(f"  Text encoder model: {text_encoder_type}")
+    
+    query_encoder = create_query_encoder(
+        model_type=text_encoder_type,
         max_length=config.grounding.text_encoder.max_length
     )
     query_encoder.to(device)
     query_encoder.eval()
     for param in query_encoder.parameters():
         param.requires_grad = False
-    print(f"✓ SimpleQueryEncoder loaded (frozen, max_length={config.grounding.text_encoder.max_length})")
+    print(f"✓ Query encoder loaded (frozen, type={text_encoder_type})")
     
     # ==========================================================================
     # ADAPTER SELECTION (Phase-0/1/3: film, cross_attention, text_visual_alignment)
@@ -922,6 +1085,34 @@ def _run_training_loop(
         
         print(f"\n✓ Hard Negative Mining: DISABLED")
         print(f"✓ MIRLLoss initialized (margin=0.2, lambda_reject=0.1)")
+    
+    # ==========================================================================
+    # FEATURE AUGMENTATION SETUP
+    # ==========================================================================
+    aug_config = getattr(config.grounding, 'augmentation', None)
+    feature_dropout = getattr(aug_config, 'feature_dropout', 0.0) if aug_config else 0.0
+    feature_noise_std = getattr(aug_config, 'feature_noise_std', 0.0) if aug_config else 0.0
+    
+    if feature_dropout > 0 or feature_noise_std > 0:
+        print(f"\n✓ Feature Augmentation: ENABLED")
+        print(f"    Feature dropout: {feature_dropout:.1%}")
+        print(f"    Feature noise std: {feature_noise_std:.4f}")
+    else:
+        print(f"\n✓ Feature Augmentation: DISABLED")
+    
+    # ==========================================================================
+    # CAPTION PARAPHRASING SETUP
+    # ==========================================================================
+    use_paraphrases = getattr(aug_config, 'use_paraphrases', False) if aug_config else False
+    paraphrase_prob = getattr(aug_config, 'paraphrase_prob', 0.3) if aug_config else 0.3
+    
+    if use_paraphrases:
+        paraphraser = CaptionParaphraser(seed=config.training.seed)
+        print(f"\n✓ Caption Paraphrasing: ENABLED")
+        print(f"    Paraphrase probability: {paraphrase_prob:.0%}")
+    else:
+        paraphraser = None
+        print(f"\n✓ Caption Paraphrasing: DISABLED")
     
     # =========================================================================
     # DATASET SETUP
@@ -1102,6 +1293,24 @@ def _run_training_loop(
             
             if B == 0 or N == 0:
                 continue
+            
+            # Apply feature augmentation during training
+            if feature_dropout > 0:
+                # Apply dropout to visual features (zeros out random features)
+                dropout_mask = torch.rand(B, N, 1, device=device) > feature_dropout
+                visual_embeddings = visual_embeddings * dropout_mask
+            
+            if feature_noise_std > 0:
+                # Add Gaussian noise to visual features
+                noise = torch.randn_like(visual_embeddings) * feature_noise_std
+                visual_embeddings = visual_embeddings + noise
+            
+            # Apply caption paraphrasing during training
+            if paraphraser is not None:
+                captions, _ = paraphraser.paraphrase_batch(
+                    captions, 
+                    paraphrase_prob=paraphrase_prob
+                )
             
             # Forward pass - encode captions
             with torch.no_grad():

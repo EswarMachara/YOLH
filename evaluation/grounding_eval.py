@@ -42,6 +42,7 @@ from training.grounding_train_v2 import (
     TrainableAdapter,
     TrainableScorer,
     SimpleQueryEncoder,
+    create_query_encoder,
     MIRLLoss,
     CachedFeatureDataset,
     collate_variable_humans,
@@ -295,10 +296,16 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
     print(f"    Adapter type: {resolved_adapter_type}")
     print(f"    Token-level alignment: {use_token_level_alignment}")
     
-    query_encoder = SimpleQueryEncoder(max_length=config.grounding.text_encoder.max_length)
+    # Get text encoder model type (minilm or clip)
+    text_encoder_type = getattr(config.grounding.text_encoder, 'model_type', 'minilm')
+    
+    query_encoder = create_query_encoder(
+        model_type=text_encoder_type,
+        max_length=config.grounding.text_encoder.max_length
+    )
     query_encoder.to(device)
     query_encoder.eval()
-    print("✓ Query encoder loaded")
+    print(f"✓ Query encoder loaded (type={text_encoder_type})")
     
     # Create adapter based on resolved experiment mode (must match training configuration)
     if resolved_adapter_type == "text_visual_alignment":

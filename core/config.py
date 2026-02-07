@@ -171,7 +171,24 @@ class TextEncoderConfig:
     
     Controls tokenization behavior for Phase-3.
     """
+    model_type: str = "minilm"  # "minilm" or "clip"
     max_length: int = 64  # Maximum token sequence length
+
+
+@dataclass
+class AugmentationConfig:
+    """
+    Training-time augmentation configuration.
+    
+    Feature-level and text-level augmentations to improve generalization.
+    """
+    # Feature-level augmentation
+    feature_dropout: float = 0.0  # Dropout rate for visual features (0.0-0.3)
+    feature_noise_std: float = 0.0  # Gaussian noise std for features (0.0-0.05)
+    
+    # Caption paraphrasing
+    use_paraphrases: bool = False  # Enable caption paraphrasing during training
+    paraphrase_prob: float = 0.3  # Probability of using paraphrase instead of original
 
 
 @dataclass
@@ -219,6 +236,8 @@ class GroundingConfig:
     text_visual_alignment: TextVisualAlignmentConfig = field(default_factory=TextVisualAlignmentConfig)
     # Hard negative mining settings (Phase-2)
     hard_negative_mining: HardNegativeMiningConfig = field(default_factory=HardNegativeMiningConfig)
+    # Training augmentation settings
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     
     def __post_init__(self):
         """Validate and resolve experiment mode."""
