@@ -57,6 +57,7 @@ class TrainingConfig:
     weight_decay: float
     grad_clip_norm: float
     max_steps_per_epoch: Optional[int] = None
+    seed: int = 42
 
 
 @dataclass
