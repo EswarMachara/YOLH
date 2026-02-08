@@ -104,11 +104,13 @@ grounding:
   # Use this to quickly switch between experiment configurations.
   # When set, this OVERRIDES adapter_type and hard_negative_mining.enabled
   # Options:
-  #   null     - Manual mode (use adapter_type and HNM settings directly)
-  #   "phase1" - Cross-attention adapter only
-  #   "phase2" - Cross-attention + hard negative mining
-  #   "phase3" - Text-visual token alignment only
+  #   null       - Manual mode (use adapter_type and HNM settings directly)
+  #   "phase1"   - Cross-attention adapter only
+  #   "phase2"   - Cross-attention + hard negative mining
+  #   "phase3"   - Text-visual token alignment only
   #   "phase3_hnm" - Text-visual alignment + hard negative mining
+  #   "phase5a"  - Contrastive pretraining + TVA + HNM
+  #   "phase5b"  - Deep transformer fusion + HNM
   experiment_mode: phase3
   
   # Adapter type (used when experiment_mode is null):
@@ -158,6 +160,26 @@ grounding:
     dropout: 0.1
     # Enable bidirectional refinement (visual→text→visual)
     bidirectional: true
+  
+  # ==========================================================================
+  # DEEP TRANSFORMER FUSION (Phase-5B)
+  # ==========================================================================
+  # Deep multi-layer transformer with spatial positional encoding
+  # Uses bounding box coordinates to encode spatial relationships
+  # Set adapter_type: transformer_fusion or experiment_mode: phase5b
+  transformer_fusion:
+    # Number of attention heads
+    num_heads: 8
+    # Number of transformer layers (deeper than TVA)
+    num_layers: 4
+    # FFN hidden dimension
+    dim_feedforward: 1024
+    # Dropout rate
+    dropout: 0.1
+    # Enable spatial positional encoding (box coordinates → position embeddings)
+    use_spatial_encoding: true
+    # Enable gated residual connections (learnable skip connections)
+    use_gated_residual: true
   
   # ==========================================================================
   # HARD NEGATIVE MINING (Phase-2)

@@ -223,6 +223,22 @@ class TextVisualAlignmentConfig:
 
 
 @dataclass
+class TransformerFusionConfig:
+    """
+    Transformer Fusion adapter configuration (Phase-5B).
+    
+    Deep multi-head cross-attention transformer for refined text-visual grounding.
+    Features: spatial positional encoding, gated residuals, inter-human reasoning.
+    """
+    num_heads: int = 8  # Number of attention heads (8 recommended for depth)
+    num_layers: int = 4  # Number of fusion layers (4-6 for deep fusion)
+    dim_feedforward: int = 1024  # FFN hidden dimension (larger for capacity)
+    dropout: float = 0.1  # Dropout rate
+    use_spatial_encoding: bool = True  # Add spatial positional encoding from boxes
+    use_gated_residual: bool = True  # Use gated residual connections
+
+
+@dataclass
 class GroundingConfig:
     """
     Grounding adapter configuration.
@@ -258,10 +274,13 @@ class GroundingConfig:
     # Contrastive pretraining settings (Phase-5A)
     contrastive: ContrastiveConfig = field(default_factory=ContrastiveConfig)
     
+    # Transformer fusion settings (Phase-5B)
+    transformer_fusion: TransformerFusionConfig = field(default_factory=TransformerFusionConfig)
+    
     def __post_init__(self):
         """Validate and resolve experiment mode."""
-        valid_types = ["cross_attention", "film", "text_visual_alignment"]
-        valid_modes = [None, "phase1", "phase2", "phase3", "phase3_hnm", "phase5a"]
+        valid_types = ["cross_attention", "film", "text_visual_alignment", "transformer_fusion"]
+        valid_modes = [None, "phase1", "phase2", "phase3", "phase3_hnm", "phase5a", "phase5b"]
         
         # Validate experiment_mode if set
         if self.experiment_mode is not None and self.experiment_mode not in valid_modes:
@@ -298,6 +317,7 @@ class GroundingConfig:
             "phase3": ("text_visual_alignment", False, "Phase-3 (Text-Visual Token Alignment)"),
             "phase3_hnm": ("text_visual_alignment", True, "Phase-3 + Phase-2 (Token Alignment + HNM)"),
             "phase5a": ("text_visual_alignment", True, "Phase-5A (Contrastive Pretrain + Token Alignment + HNM)"),
+            "phase5b": ("transformer_fusion", True, "Phase-5B (Deep Transformer Fusion + HNM)"),
         }
         
         return mode_mapping[self.experiment_mode]

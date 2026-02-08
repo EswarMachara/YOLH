@@ -1186,6 +1186,8 @@ def _run_training_loop(
     
     # Track if we're using token-level alignment (affects forward pass)
     use_token_level_alignment = False
+    # Track if we're using transformer fusion (needs boxes for spatial encoding)
+    use_transformer_fusion = False
     
     if adapter_type == "cross_attention":
         # Phase-1 improvement: Cross-Attention based grounding
@@ -1225,6 +1227,30 @@ def _run_training_loop(
         print(f"    dropout: {tva_config.dropout}")
         print(f"    bidirectional: {tva_config.bidirectional}")
         print(f"✓ Token-level cross-attention active (max_length={config.grounding.text_encoder.max_length})")
+    elif adapter_type == "transformer_fusion":
+        # Phase-5B: Deep Transformer Fusion with spatial encoding
+        tf_config = config.grounding.transformer_fusion
+        adapter = create_grounding_adapter(
+            adapter_type="transformer_fusion",
+            token_dim=D_TOKEN,
+            query_dim=D_QUERY,
+            num_heads=tf_config.num_heads,
+            num_layers=tf_config.num_layers,
+            dim_feedforward=tf_config.dim_feedforward,
+            dropout=tf_config.dropout,
+            use_spatial_encoding=tf_config.use_spatial_encoding,
+            use_gated_residual=tf_config.use_gated_residual,
+        )
+        use_token_level_alignment = True  # Uses token-level text embeddings
+        use_transformer_fusion = True  # Needs boxes for spatial encoding
+        print(f"✓ TransformerFusionAdapter initialized (Phase-5B, trainable)")
+        print(f"    num_heads: {tf_config.num_heads}")
+        print(f"    num_layers: {tf_config.num_layers}")
+        print(f"    dim_feedforward: {tf_config.dim_feedforward}")
+        print(f"    dropout: {tf_config.dropout}")
+        print(f"    spatial_encoding: {tf_config.use_spatial_encoding}")
+        print(f"    gated_residual: {tf_config.use_gated_residual}")
+        print(f"✓ Deep transformer fusion active (max_length={config.grounding.text_encoder.max_length})")
     else:
         # Baseline: FiLM-style adapter (Phase-0)
         adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
@@ -1513,7 +1539,11 @@ def _run_training_loop(
                 
                 # Forward through adapter to get grounded representations
                 if use_token_level_alignment:
-                    grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
+                    if use_transformer_fusion:
+                        # Phase-5B: Deep transformer fusion with spatial encoding
+                        grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask, boxes=boxes)
+                    else:
+                        grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
                 else:
                     grounded_tokens = adapter(visual_embeddings, query_embeddings)
                 
@@ -1679,8 +1709,12 @@ def _run_training_loop(
             
             # Forward pass - adapter
             if use_token_level_alignment:
-                # Phase-3: Token-level cross-modal alignment
-                grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
+                # Phase-3/5B: Token-level cross-modal alignment
+                if use_transformer_fusion:
+                    # Phase-5B: Deep transformer fusion with spatial encoding
+                    grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask, boxes=boxes)
+                else:
+                    grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
             else:
                 # Phase-0/1: Sentence-level grounding
                 grounded_tokens = adapter(visual_embeddings, query_embeddings)

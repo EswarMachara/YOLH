@@ -352,7 +352,7 @@ def create_grounding_adapter(
     Factory function to create grounding adapter.
     
     Args:
-        adapter_type: "cross_attention", "film", or "text_visual_alignment"
+        adapter_type: "cross_attention", "film", "text_visual_alignment", or "transformer_fusion"
         token_dim: Token dimension
         query_dim: Query dimension
         **kwargs: Additional arguments for specific adapter types
@@ -364,6 +364,7 @@ def create_grounding_adapter(
         - "film": FiLM-style modulation (Phase-0 baseline)
         - "cross_attention": Query-to-human cross-attention (Phase-1)
         - "text_visual_alignment": Token-level cross-modal attention (Phase-3)
+        - "transformer_fusion": Deep transformer fusion with spatial encoding (Phase-5B)
     """
     if adapter_type == "cross_attention":
         return CrossAttentionAdapter(
@@ -385,6 +386,18 @@ def create_grounding_adapter(
             dropout=kwargs.get("dropout", 0.1),
             bidirectional=kwargs.get("bidirectional", True),
         )
+    elif adapter_type == "transformer_fusion":
+        # Phase-5B: Deep transformer fusion with spatial encoding
+        from adapter.transformer_fusion_adapter import TransformerFusionAdapter
+        return TransformerFusionAdapter(
+            token_dim=token_dim,
+            num_heads=kwargs.get("num_heads", 8),
+            num_layers=kwargs.get("num_layers", 4),
+            dim_feedforward=kwargs.get("dim_feedforward", 1024),
+            dropout=kwargs.get("dropout", 0.1),
+            use_spatial_encoding=kwargs.get("use_spatial_encoding", True),
+            use_gated_residual=kwargs.get("use_gated_residual", True),
+        )
     elif adapter_type == "film":
         # Import the original FiLM adapter for backward compatibility
         from training.grounding_train_v2 import TrainableAdapter
@@ -392,7 +405,7 @@ def create_grounding_adapter(
     else:
         raise ValueError(
             f"Unknown adapter type: {adapter_type}. "
-            f"Choose 'cross_attention', 'text_visual_alignment', or 'film'."
+            f"Choose 'cross_attention', 'text_visual_alignment', 'transformer_fusion', or 'film'."
         )
 
 
