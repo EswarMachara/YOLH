@@ -123,8 +123,8 @@ grounding:
   # Controls text encoder model and tokenization
   text_encoder:
     # Model type: "minilm" (baseline, 384D) or "clip" (improved, 512D)
-    # CLIP is trained for vision-language alignment and provides better embeddings
-    model_type: clip
+    # MiniLM performs better on this task (43.2% vs 41.9% MSR)
+    model_type: minilm
     # Maximum token sequence length (affects Phase-3 token-level grounding)
     # CLIP max is 77 tokens. Recommended: >= 32 to avoid truncating descriptions
     max_length: 64
@@ -187,11 +187,24 @@ grounding:
   # Feature and text augmentations to improve generalization
   augmentation:
     # Feature-level augmentation (applied to cached visual features)
-    feature_dropout: 0.1         # Dropout rate for visual features (0.0-0.3)
-    feature_noise_std: 0.02      # Gaussian noise std for features (0.0-0.05)
+    feature_dropout: 0.0         # Dropout rate for visual features (0.0-0.3) - disabled by default
+    feature_noise_std: 0.0       # Gaussian noise std for features (0.0-0.05) - disabled by default
     # Caption paraphrasing (text-side augmentation)
     use_paraphrases: false       # Enable caption paraphrasing
     paraphrase_prob: 0.3         # Probability of using paraphrase
+
+  # ==========================================================================
+  # CONTRASTIVE PRETRAINING (Phase-5A)
+  # ==========================================================================
+  # InfoNCE-based alignment of text and visual embedding spaces
+  # Runs BEFORE margin-based training to create better initial representations
+  contrastive:
+    enabled: false               # Enable contrastive pretraining stage
+    num_epochs: 10               # Number of contrastive pretraining epochs
+    temperature: 0.07            # Softmax temperature (lower = sharper distribution)
+    learning_rate: 0.0001        # Learning rate for contrastive stage
+    use_hard_negatives: true     # Use in-sample non-GT humans as hard negatives
+    warmup_ratio: 0.1            # Warmup ratio for learning rate scheduler
 
 # =============================================================================
 # OUTPUTS CONFIGURATION

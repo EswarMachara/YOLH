@@ -193,6 +193,22 @@ class AugmentationConfig:
 
 
 @dataclass
+class ContrastiveConfig:
+    """
+    Contrastive pretraining configuration (Phase-5A).
+    
+    InfoNCE-based alignment of text and visual embedding spaces
+    before margin-based fine-tuning.
+    """
+    enabled: bool = False  # Enable contrastive pretraining stage
+    num_epochs: int = 10  # Number of contrastive pretraining epochs
+    temperature: float = 0.07  # Softmax temperature (lower = sharper)
+    learning_rate: float = 1e-4  # Learning rate for contrastive stage
+    use_hard_negatives: bool = True  # Use in-sample non-GT humans as hard negatives
+    warmup_ratio: float = 0.1  # Warmup ratio for learning rate scheduler
+
+
+@dataclass
 class TextVisualAlignmentConfig:
     """
     Text-Visual Alignment adapter configuration (Phase-3).
@@ -239,11 +255,13 @@ class GroundingConfig:
     hard_negative_mining: HardNegativeMiningConfig = field(default_factory=HardNegativeMiningConfig)
     # Training augmentation settings
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+    # Contrastive pretraining settings (Phase-5A)
+    contrastive: ContrastiveConfig = field(default_factory=ContrastiveConfig)
     
     def __post_init__(self):
         """Validate and resolve experiment mode."""
         valid_types = ["cross_attention", "film", "text_visual_alignment"]
-        valid_modes = [None, "phase1", "phase2", "phase3", "phase3_hnm"]
+        valid_modes = [None, "phase1", "phase2", "phase3", "phase3_hnm", "phase5a"]
         
         # Validate experiment_mode if set
         if self.experiment_mode is not None and self.experiment_mode not in valid_modes:
@@ -279,6 +297,7 @@ class GroundingConfig:
             "phase2": ("cross_attention", True, "Phase-2 (Cross-Attention + Hard Negative Mining)"),
             "phase3": ("text_visual_alignment", False, "Phase-3 (Text-Visual Token Alignment)"),
             "phase3_hnm": ("text_visual_alignment", True, "Phase-3 + Phase-2 (Token Alignment + HNM)"),
+            "phase5a": ("text_visual_alignment", True, "Phase-5A (Contrastive Pretrain + Token Alignment + HNM)"),
         }
         
         return mode_mapping[self.experiment_mode]

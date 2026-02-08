@@ -33,6 +33,7 @@ import json
 import random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import time
@@ -510,6 +511,190 @@ class MIRLLoss(nn.Module):
             "total": total,
             "ranking": total_ranking_loss,
             "rejection": total_rejection_loss,
+        }
+
+
+# =============================================================================
+# INFONCE CONTRASTIVE LOSS (Phase-5A)
+# =============================================================================
+
+class InfoNCELoss(nn.Module):
+    """
+    InfoNCE (Noise Contrastive Estimation) loss for contrastive pretraining.
+    
+    Aligns text-visual embedding spaces before margin-based fine-tuning.
+    Uses in-batch negatives: for each (text, visual) positive pair,
+    all other visuals in the batch serve as negatives.
+    
+    L = -log(exp(sim(q, v+)/τ) / Σ exp(sim(q, vi)/τ))
+    
+    Args:
+        temperature: Softmax temperature (lower = sharper distribution)
+        learnable_temp: If True, temperature is a learnable parameter
+    """
+    
+    def __init__(self, temperature: float = 0.07, learnable_temp: bool = False):
+        super().__init__()
+        if learnable_temp:
+            self.temperature = nn.Parameter(torch.tensor(temperature))
+        else:
+            self.register_buffer('temperature', torch.tensor(temperature))
+    
+    def forward(
+        self,
+        text_embeddings: torch.Tensor,  # [B, D] - query/text embeddings
+        visual_embeddings: torch.Tensor,  # [B, D] - positive visual embeddings (GT human)
+        all_visual_embeddings: Optional[torch.Tensor] = None,  # [B, N, D] - all humans per sample
+        valid: Optional[torch.Tensor] = None,  # [B, N] - validity mask
+        gt_indices: Optional[torch.Tensor] = None,  # [B] - GT human indices
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute InfoNCE loss.
+        
+        Two modes:
+        1. Simple mode: text_embeddings [B,D] vs visual_embeddings [B,D]
+           Uses in-batch negatives (other samples' positives)
+        
+        2. Full mode: With all_visual_embeddings, valid, gt_indices
+           Uses both in-batch and in-sample negatives (non-GT humans in same image)
+        """
+        B, D = text_embeddings.shape
+        device = text_embeddings.device
+        
+        # Normalize embeddings for cosine similarity
+        text_norm = F.normalize(text_embeddings, p=2, dim=-1)  # [B, D]
+        visual_norm = F.normalize(visual_embeddings, p=2, dim=-1)  # [B, D]
+        
+        # Compute similarity matrix [B, B] - each row is one text vs all visuals
+        sim_matrix = torch.matmul(text_norm, visual_norm.T) / self.temperature  # [B, B]
+        
+        # Labels: diagonal entries are positives (index i matches index i)
+        labels = torch.arange(B, device=device)
+        
+        # Cross-entropy loss (InfoNCE)
+        loss_t2v = F.cross_entropy(sim_matrix, labels)  # text→visual
+        loss_v2t = F.cross_entropy(sim_matrix.T, labels)  # visual→text
+        
+        loss = (loss_t2v + loss_v2t) / 2
+        
+        # Compute accuracy for monitoring
+        with torch.no_grad():
+            preds_t2v = sim_matrix.argmax(dim=1)
+            preds_v2t = sim_matrix.T.argmax(dim=1)
+            acc_t2v = (preds_t2v == labels).float().mean()
+            acc_v2t = (preds_v2t == labels).float().mean()
+            accuracy = (acc_t2v + acc_v2t) / 2
+        
+        return {
+            "total": loss,
+            "loss_t2v": loss_t2v,
+            "loss_v2t": loss_v2t,
+            "accuracy": accuracy,
+        }
+
+
+class InfoNCEWithHardNegatives(nn.Module):
+    """
+    InfoNCE loss with in-sample hard negatives.
+    
+    For each sample, uses:
+    - Positive: GT human visual embedding
+    - Hard negatives: non-GT humans in the same image
+    - In-batch negatives: other samples' GT humans
+    
+    This gives stronger contrastive signal for crowded scenes.
+    """
+    
+    def __init__(self, temperature: float = 0.07, hard_weight: float = 1.0):
+        super().__init__()
+        self.register_buffer('temperature', torch.tensor(temperature))
+        self.hard_weight = hard_weight
+    
+    def forward(
+        self,
+        text_embeddings: torch.Tensor,  # [B, D]
+        all_visual_embeddings: torch.Tensor,  # [B, N, D]
+        valid: torch.Tensor,  # [B, N]
+        gt_indices: torch.Tensor,  # [B]
+    ) -> Dict[str, torch.Tensor]:
+        B, N, D = all_visual_embeddings.shape
+        device = text_embeddings.device
+        
+        # Normalize
+        text_norm = F.normalize(text_embeddings, p=2, dim=-1)  # [B, D]
+        visual_norm = F.normalize(all_visual_embeddings, p=2, dim=-1)  # [B, N, D]
+        
+        total_loss = torch.tensor(0.0, device=device)
+        total_acc = 0.0
+        valid_samples = 0
+        
+        for b in range(B):
+            gt_idx = gt_indices[b].item()
+            if gt_idx < 0 or gt_idx >= N or not valid[b, gt_idx]:
+                continue
+            
+            valid_samples += 1
+            
+            # Text query for this sample
+            q = text_norm[b]  # [D]
+            
+            # Positive: GT human
+            pos_visual = visual_norm[b, gt_idx]  # [D]
+            pos_sim = torch.dot(q, pos_visual) / self.temperature
+            
+            # In-sample negatives (non-GT humans in same image)
+            valid_mask = valid[b].clone()
+            valid_mask[gt_idx] = False
+            in_sample_negs = visual_norm[b][valid_mask]  # [K, D] where K = num valid non-GT
+            
+            # In-batch negatives (other samples' GT humans)
+            in_batch_negs = []
+            for b2 in range(B):
+                if b2 == b:
+                    continue
+                gt_idx2 = gt_indices[b2].item()
+                if gt_idx2 >= 0 and gt_idx2 < N and valid[b2, gt_idx2]:
+                    in_batch_negs.append(visual_norm[b2, gt_idx2])
+            
+            if len(in_batch_negs) > 0:
+                in_batch_negs = torch.stack(in_batch_negs)  # [B-1, D]
+            else:
+                in_batch_negs = torch.empty(0, D, device=device)
+            
+            # Combine all negatives
+            if in_sample_negs.shape[0] > 0 and in_batch_negs.shape[0] > 0:
+                all_negs = torch.cat([in_sample_negs, in_batch_negs], dim=0)
+            elif in_sample_negs.shape[0] > 0:
+                all_negs = in_sample_negs
+            elif in_batch_negs.shape[0] > 0:
+                all_negs = in_batch_negs
+            else:
+                # No negatives available, skip
+                continue
+            
+            # Compute negative similarities
+            neg_sims = torch.matmul(all_negs, q) / self.temperature  # [num_negs]
+            
+            # InfoNCE: -log(exp(pos) / (exp(pos) + sum(exp(neg))))
+            logits = torch.cat([pos_sim.unsqueeze(0), neg_sims])  # [1 + num_negs]
+            labels = torch.tensor([0], device=device)  # positive is at index 0
+            
+            loss = F.cross_entropy(logits.unsqueeze(0), labels)
+            total_loss = total_loss + loss
+            
+            # Accuracy
+            pred = logits.argmax()
+            total_acc += (pred == 0).float().item()
+        
+        if valid_samples > 0:
+            total_loss = total_loss / valid_samples
+            accuracy = total_acc / valid_samples
+        else:
+            accuracy = 0.0
+        
+        return {
+            "total": total_loss,
+            "accuracy": torch.tensor(accuracy, device=device),
         }
 
 
@@ -1240,7 +1425,172 @@ def _run_training_loop(
     print("\n  Best model selection criterion: VAL Margin Success Rate")
     
     # =========================================================================
-    # TRAINING LOOP
+    # PHASE-5A: CONTRASTIVE PRETRAINING (Optional)
+    # =========================================================================
+    
+    contrastive_config = getattr(config.grounding, 'contrastive', None)
+    contrastive_enabled = getattr(contrastive_config, 'enabled', False) if contrastive_config else False
+    
+    if contrastive_enabled:
+        print("\n" + "=" * 70)
+        print("PHASE-5A: CONTRASTIVE PRETRAINING")
+        print("=" * 70)
+        
+        contrastive_epochs = getattr(contrastive_config, 'num_epochs', 10)
+        contrastive_lr = getattr(contrastive_config, 'learning_rate', 1e-4)
+        contrastive_temp = getattr(contrastive_config, 'temperature', 0.07)
+        use_hard_negs = getattr(contrastive_config, 'use_hard_negatives', True)
+        
+        print(f"  Contrastive epochs: {contrastive_epochs}")
+        print(f"  Learning rate: {contrastive_lr}")
+        print(f"  Temperature: {contrastive_temp}")
+        print(f"  Hard negatives: {'YES' if use_hard_negs else 'NO'}")
+        
+        # Create contrastive loss function
+        if use_hard_negs:
+            contrastive_loss_fn = InfoNCEWithHardNegatives(temperature=contrastive_temp)
+        else:
+            contrastive_loss_fn = InfoNCELoss(temperature=contrastive_temp)
+        
+        # Separate optimizer for contrastive pretraining
+        contrastive_optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=contrastive_lr,
+            weight_decay=config.training.weight_decay,
+        )
+        
+        contrastive_steps = len(train_dataloader) * contrastive_epochs
+        contrastive_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            contrastive_optimizer,
+            T_max=contrastive_steps,
+            eta_min=contrastive_lr * 0.01,
+        )
+        
+        # Contrastive pretraining CSV logger
+        contrastive_logger = CSVLogger(
+            logs_dir / "contrastive_metrics.csv",
+            columns=["epoch", "loss", "accuracy", "timestamp"],
+            overwrite=True,
+        )
+        
+        print(f"\n  Starting contrastive pretraining...")
+        
+        for c_epoch in range(contrastive_epochs):
+            print(f"\n  [Contrastive Epoch {c_epoch + 1}/{contrastive_epochs}]")
+            
+            adapter.train()
+            scorer.train()
+            
+            epoch_c_losses = []
+            epoch_c_accs = []
+            
+            c_pbar = tqdm(train_dataloader, desc=f"Contrastive Epoch {c_epoch+1}")
+            
+            for batch_idx, batch in enumerate(c_pbar):
+                if max_steps_per_epoch is not None and batch_idx >= max_steps_per_epoch:
+                    break
+                
+                if batch is None:
+                    continue
+                
+                visual_embeddings = batch['visual_embeddings'].to(device)
+                valid = batch['valid'].to(device)
+                captions = batch['caption']
+                gt_indices = batch['gt_index'].to(device)
+                
+                B, N, D = visual_embeddings.shape
+                
+                if B == 0 or N == 0:
+                    continue
+                
+                # Encode text queries
+                with torch.no_grad():
+                    if use_token_level_alignment:
+                        caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
+                        query_embeddings = query_encoder.forward_batch(captions)
+                    else:
+                        query_embeddings = query_encoder.forward_batch(captions)
+                
+                # Forward through adapter to get grounded representations
+                if use_token_level_alignment:
+                    grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
+                else:
+                    grounded_tokens = adapter(visual_embeddings, query_embeddings)
+                
+                # Get GT visual embeddings for contrastive learning
+                gt_visual_list = []
+                valid_batch_indices = []
+                for b in range(B):
+                    gt_idx = gt_indices[b].item()
+                    if 0 <= gt_idx < N and valid[b, gt_idx]:
+                        gt_visual_list.append(grounded_tokens[b, gt_idx])
+                        valid_batch_indices.append(b)
+                
+                if len(gt_visual_list) < 2:
+                    # Need at least 2 samples for contrastive learning
+                    continue
+                
+                gt_visual = torch.stack(gt_visual_list)  # [B', D]
+                valid_query = query_embeddings[valid_batch_indices]  # [B', D]
+                
+                # Compute contrastive loss
+                if use_hard_negs:
+                    # Filter batch for valid samples
+                    valid_visual = grounded_tokens[valid_batch_indices]  # [B', N, D]
+                    valid_mask = valid[valid_batch_indices]  # [B', N]
+                    valid_gt_idx = gt_indices[valid_batch_indices]  # [B']
+                    
+                    c_loss_dict = contrastive_loss_fn(
+                        text_embeddings=valid_query,
+                        all_visual_embeddings=valid_visual,
+                        valid=valid_mask,
+                        gt_indices=valid_gt_idx,
+                    )
+                else:
+                    c_loss_dict = contrastive_loss_fn(
+                        text_embeddings=valid_query,
+                        visual_embeddings=gt_visual,
+                    )
+                
+                c_loss = c_loss_dict["total"]
+                c_acc = c_loss_dict["accuracy"]
+                
+                if torch.isnan(c_loss) or torch.isinf(c_loss):
+                    continue
+                
+                # Backward & optimize
+                contrastive_optimizer.zero_grad()
+                c_loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=config.training.grad_clip_norm)
+                contrastive_optimizer.step()
+                contrastive_scheduler.step()
+                
+                epoch_c_losses.append(c_loss.item())
+                epoch_c_accs.append(c_acc.item() if isinstance(c_acc, torch.Tensor) else c_acc)
+                
+                c_pbar.set_postfix({
+                    "loss": f"{c_loss.item():.4f}",
+                    "acc": f"{c_acc.item() if isinstance(c_acc, torch.Tensor) else c_acc:.2%}",
+                })
+            
+            # Log contrastive epoch
+            avg_c_loss = sum(epoch_c_losses) / len(epoch_c_losses) if epoch_c_losses else 0
+            avg_c_acc = sum(epoch_c_accs) / len(epoch_c_accs) if epoch_c_accs else 0
+            
+            contrastive_logger.write({
+                "epoch": c_epoch + 1,
+                "loss": avg_c_loss,
+                "accuracy": avg_c_acc,
+            })
+            
+            print(f"    Contrastive Loss: {avg_c_loss:.4f} | Accuracy: {avg_c_acc:.2%}")
+        
+        print(f"\n  ✓ Contrastive pretraining complete!")
+        print(f"    Final accuracy: {avg_c_acc:.2%}")
+        contrastive_logger.close()
+    
+    # =========================================================================
+    # TRAINING LOOP (Main - Margin-based)
     # =========================================================================
     
     print("\n" + "-" * 50)
