@@ -1607,7 +1607,7 @@ def _run_training_loop(
             avg_c_loss = sum(epoch_c_losses) / len(epoch_c_losses) if epoch_c_losses else 0
             avg_c_acc = sum(epoch_c_accs) / len(epoch_c_accs) if epoch_c_accs else 0
             
-            contrastive_logger.write({
+            contrastive_logger.log({
                 "epoch": c_epoch + 1,
                 "loss": avg_c_loss,
                 "accuracy": avg_c_acc,
@@ -1617,7 +1617,6 @@ def _run_training_loop(
         
         print(f"\n  ✓ Contrastive pretraining complete!")
         print(f"    Final accuracy: {avg_c_acc:.2%}")
-        contrastive_logger.close()
     
     # =========================================================================
     # TRAINING LOOP (Main - Margin-based)

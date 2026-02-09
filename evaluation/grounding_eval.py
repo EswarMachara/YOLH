@@ -49,6 +49,7 @@ from training.grounding_train_v2 import (
 )
 from adapter.cross_attention_adapter import CrossAttentionAdapter, create_grounding_adapter
 from adapter.text_visual_alignment_adapter import TextVisualAlignmentAdapter
+from adapter.transformer_fusion_adapter import TransformerFusionAdapter
 
 
 def load_checkpoint(checkpoint_path: Path, device: str) -> Dict:
@@ -93,6 +94,7 @@ def evaluate_test_split(
     test_dataloader: DataLoader,
     device: str,
     use_token_level_alignment: bool = False,
+    use_transformer_fusion: bool = False,
 ) -> GroundingMetrics:
     """
     Evaluate on TEST split and compute all metrics.
@@ -105,6 +107,7 @@ def evaluate_test_split(
         test_dataloader: Test data loader
         device: Device string
         use_token_level_alignment: If True, use Phase-3 token-level alignment
+        use_transformer_fusion: If True, pass boxes for spatial encoding (Phase-5B)
     
     Returns:
         GroundingMetrics for test set
@@ -134,12 +137,16 @@ def evaluate_test_split(
         
         # Forward pass - encode captions
         if use_token_level_alignment:
-            # Phase-3: Token-level embeddings [B, T, 256] + mask [B, T]
+            # Phase-3/5B: Token-level embeddings [B, T, 256] + mask [B, T]
             caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
             # Also get sentence-level for scorer
             query_embeddings = query_encoder.forward_batch(captions)
-            # Phase-3: Token-level cross-modal alignment
-            grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
+            # Token-level cross-modal alignment
+            if use_transformer_fusion:
+                # Phase-5B: Deep transformer fusion with spatial encoding
+                grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask, boxes=boxes)
+            else:
+                grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
         else:
             # Phase-0/1: Sentence-level embedding [B, 256]
             query_embeddings = query_encoder.forward_batch(captions)
@@ -290,11 +297,13 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
     
     # Resolve experiment mode to get correct adapter type
     resolved_adapter_type, resolved_hnm_enabled, mode_description = config.grounding.resolve_experiment_mode()
-    use_token_level_alignment = (resolved_adapter_type == "text_visual_alignment")
+    use_token_level_alignment = (resolved_adapter_type in ["text_visual_alignment", "transformer_fusion"])
+    use_transformer_fusion = (resolved_adapter_type == "transformer_fusion")
     
-    print(f"\n🎛️  Experiment Mode: {mode_description}")
+    print(f"\n⚙️  Experiment Mode: {mode_description}")
     print(f"    Adapter type: {resolved_adapter_type}")
     print(f"    Token-level alignment: {use_token_level_alignment}")
+    print(f"    Transformer fusion: {use_transformer_fusion}")
     
     # Get text encoder model type (minilm or clip)
     text_encoder_type = getattr(config.grounding.text_encoder, 'model_type', 'minilm')
@@ -332,6 +341,19 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
             dropout=ca_config.dropout,
         )
         print(f"✓ CrossAttentionAdapter created (matching config)")
+    elif resolved_adapter_type == "transformer_fusion":
+        # Phase-5B: TransformerFusionAdapter
+        tf_config = config.grounding.transformer_fusion
+        adapter = TransformerFusionAdapter(
+            token_dim=D_TOKEN,
+            num_heads=tf_config.num_heads,
+            num_layers=tf_config.num_layers,
+            dim_feedforward=tf_config.dim_feedforward,
+            dropout=tf_config.dropout,
+            use_spatial_encoding=tf_config.use_spatial_encoding,
+            use_gated_residual=tf_config.use_gated_residual,
+        )
+        print(f"✓ TransformerFusionAdapter created (Phase-5B)")
     else:
         adapter = TrainableAdapter(token_dim=D_TOKEN, query_dim=D_QUERY)
         print(f"✓ TrainableAdapter (FiLM) created")
@@ -397,6 +419,7 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
         test_dataloader=test_dataloader,
         device=device,
         use_token_level_alignment=use_token_level_alignment,
+        use_transformer_fusion=use_transformer_fusion,
     )
     
     # Save results
