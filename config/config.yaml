@@ -109,7 +109,7 @@ grounding:
   #   "phase2" - Cross-attention + hard negative mining
   #   "phase3" - Text-visual token alignment only
   #   "phase3_hnm" - Text-visual alignment + hard negative mining
-  experiment_mode: phase3
+  experiment_mode: phase3_hnm
   
   # Adapter type (used when experiment_mode is null):
   #   "film" - FiLM baseline (Phase-0)
@@ -163,7 +163,7 @@ grounding:
   # Set enabled: true to activate Phase-2 improvements
   hard_negative_mining:
     # Master switch - set to true for Phase-2 experiments
-    enabled: false
+    enabled: true
     # Difficulty score weights (must sum to 1.0)
     # Higher weight = more influence on difficulty score
     weight_iou: 0.5      # IoU overlap with GT (spatial proximity)
