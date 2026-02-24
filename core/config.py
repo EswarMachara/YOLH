@@ -82,6 +82,7 @@ class SplitsConfig:
     val: float = 0.1
     test: float = 0.1
     seed: int = 42
+    split_file: Optional[str] = None  # Path to persistent split file for reproducibility
     
     def __post_init__(self):
         """Validate split ratios sum to 1.0."""

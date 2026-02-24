@@ -14,12 +14,57 @@ Metrics:
 - Rejection Accuracy: Correct rejection when no GT
 - Avg GT Score: Scalar
 - Avg Max Neg Score: Scalar
+
+Standard Grounding Metrics (for RefCOCO comparison):
+- Acc@0.5: Accuracy at IoU >= 0.5 (standard RefCOCO metric)
+- Acc@0.25: Accuracy at IoU >= 0.25 (lenient)
+- Acc@0.75: Accuracy at IoU >= 0.75 (strict)
+- Mean IoU: Average IoU between predicted and GT boxes
+- Recall@5: GT in top-5 predictions
+- Recall@10: GT in top-10 predictions
 """
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import torch
 import math
+
+
+def compute_box_iou(box1: torch.Tensor, box2: torch.Tensor) -> float:
+    """
+    Compute IoU between two boxes.
+    
+    Args:
+        box1: [4] tensor in xyxy format (can be normalized or pixel coords)
+        box2: [4] tensor in xyxy format
+        
+    Returns:
+        IoU value as float
+    """
+    # Extract coordinates
+    x1_1, y1_1, x2_1, y2_1 = box1[0].item(), box1[1].item(), box1[2].item(), box1[3].item()
+    x1_2, y1_2, x2_2, y2_2 = box2[0].item(), box2[1].item(), box2[2].item(), box2[3].item()
+    
+    # Intersection
+    x1_inter = max(x1_1, x1_2)
+    y1_inter = max(y1_1, y1_2)
+    x2_inter = min(x2_1, x2_2)
+    y2_inter = min(y2_1, y2_2)
+    
+    # Intersection area
+    w_inter = max(0, x2_inter - x1_inter)
+    h_inter = max(0, y2_inter - y1_inter)
+    area_inter = w_inter * h_inter
+    
+    # Union area
+    area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+    area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    area_union = area1 + area2 - area_inter
+    
+    if area_union < 1e-8:
+        return 0.0
+    
+    return area_inter / area_union
 
 
 @dataclass
@@ -38,6 +83,14 @@ class GroundingMetrics:
     avg_gt_score: float = 0.0
     avg_max_neg_score: float = 0.0
     
+    # Standard grounding metrics (for RefCOCO comparison)
+    acc_at_025: float = 0.0   # Accuracy at IoU >= 0.25 (lenient)
+    acc_at_050: float = 0.0   # Accuracy at IoU >= 0.5 (standard)
+    acc_at_075: float = 0.0   # Accuracy at IoU >= 0.75 (strict)
+    mean_iou: float = 0.0     # Average IoU between predicted and GT boxes
+    recall_at_5: float = 0.0  # GT in top-5 predictions
+    recall_at_10: float = 0.0 # GT in top-10 predictions
+    
     # Counts for aggregation
     n_samples: int = 0
     n_samples_with_gt: int = 0
@@ -54,6 +107,15 @@ class GroundingMetrics:
     n_keypoints_correct: int = 0
     sum_loss: float = 0.0
     
+    # IoU-based metric accumulators
+    n_acc_025_correct: int = 0
+    n_acc_050_correct: int = 0
+    n_acc_075_correct: int = 0
+    sum_iou: float = 0.0
+    n_iou_computed: int = 0
+    n_recall_5_correct: int = 0
+    n_recall_10_correct: int = 0
+    
     def to_dict(self) -> Dict[str, float]:
         """Convert to dictionary for CSV/JSON export."""
         return {
@@ -66,6 +128,13 @@ class GroundingMetrics:
             # "rejection_accuracy": self.rejection_accuracy,
             "avg_gt_score": self.avg_gt_score,
             "avg_max_neg_score": self.avg_max_neg_score,
+            # Standard grounding metrics
+            "acc_at_025": self.acc_at_025,
+            "acc_at_050": self.acc_at_050,
+            "acc_at_075": self.acc_at_075,
+            "mean_iou": self.mean_iou,
+            "recall_at_5": self.recall_at_5,
+            "recall_at_10": self.recall_at_10,
             "n_samples": self.n_samples,
         }
 
@@ -95,6 +164,14 @@ class MetricsComputer:
         self._n_keypoints_evaluated = 0
         self._n_keypoints_correct = 0
         self._sum_loss = 0.0
+        # IoU-based metrics accumulators
+        self._n_acc_025_correct = 0
+        self._n_acc_050_correct = 0
+        self._n_acc_075_correct = 0
+        self._sum_iou = 0.0
+        self._n_iou_computed = 0
+        self._n_recall_5_correct = 0
+        self._n_recall_10_correct = 0
     
     def compute_batch_metrics(
         self,
@@ -105,6 +182,7 @@ class MetricsComputer:
         keypoints_pred: Optional[torch.Tensor] = None,
         keypoints_gt: Optional[torch.Tensor] = None,
         boxes: Optional[torch.Tensor] = None,
+        gt_boxes: Optional[torch.Tensor] = None,
     ) -> GroundingMetrics:
         """
         Compute metrics for a single batch.
@@ -116,7 +194,8 @@ class MetricsComputer:
             loss: Optional scalar loss tensor
             keypoints_pred: [B, N, 17, 3] predicted keypoints (for PCK)
             keypoints_gt: [B, 17, 3] ground truth keypoints (for PCK)
-            boxes: [B, N, 4] bounding boxes (for PCK normalization)
+            boxes: [B, N, 4] bounding boxes (for PCK normalization and IoU)
+            gt_boxes: [B, 4] ground truth boxes for IoU computation (optional, uses boxes[b, gt_idx] if None)
         
         Returns:
             GroundingMetrics for this batch
@@ -188,6 +267,53 @@ class MetricsComputer:
             # Rank = 1 + count of valid humans with score > gt_score
             rank = 1 + (sample_scores[valid_mask] > gt_score).sum().item()
             metrics.sum_gt_rank += rank
+            
+            # =================================================================
+            # Recall@K: Check if GT is in top-K predictions
+            # =================================================================
+            # Get sorted indices by score (descending)
+            sorted_indices = torch.argsort(sample_scores[valid_mask], descending=True)
+            # Map back to original indices
+            valid_indices = torch.where(valid_mask)[0]
+            sorted_orig_indices = valid_indices[sorted_indices].tolist()
+            
+            # Recall@5: GT in top-5
+            if gt_idx in sorted_orig_indices[:5]:
+                metrics.n_recall_5_correct += 1
+            
+            # Recall@10: GT in top-10
+            if gt_idx in sorted_orig_indices[:10]:
+                metrics.n_recall_10_correct += 1
+            
+            # =================================================================
+            # IoU-based metrics: Compare predicted box with GT box
+            # =================================================================
+            if boxes is not None:
+                # Get GT box (either from gt_boxes or from boxes at gt_idx)
+                if gt_boxes is not None:
+                    gt_box = gt_boxes[b]
+                else:
+                    gt_box = boxes[b, gt_idx]
+                
+                # Get predicted box (box of top-scoring valid human)
+                pred_box = boxes[b, pred_idx]
+                
+                # Compute IoU
+                iou = compute_box_iou(pred_box, gt_box)
+                metrics.sum_iou += iou
+                metrics.n_iou_computed += 1
+                
+                # Acc@0.25 (lenient)
+                if iou >= 0.25:
+                    metrics.n_acc_025_correct += 1
+                
+                # Acc@0.5 (standard RefCOCO metric)
+                if iou >= 0.5:
+                    metrics.n_acc_050_correct += 1
+                
+                # Acc@0.75 (strict)
+                if iou >= 0.75:
+                    metrics.n_acc_075_correct += 1
             
             # PCK@50 computation
             if keypoints_pred is not None and keypoints_gt is not None and boxes is not None:
@@ -290,6 +416,25 @@ class MetricsComputer:
         # Loss
         if metrics.n_samples > 0 and metrics.sum_loss > 0:
             metrics.loss = metrics.sum_loss / metrics.n_samples
+        
+        # =================================================================
+        # IoU-based metrics (standard grounding metrics)
+        # =================================================================
+        if metrics.n_samples_with_gt > 0:
+            # Acc@0.25 (lenient threshold)
+            metrics.acc_at_025 = metrics.n_acc_025_correct / metrics.n_samples_with_gt
+            # Acc@0.5 (standard RefCOCO metric)
+            metrics.acc_at_050 = metrics.n_acc_050_correct / metrics.n_samples_with_gt
+            # Acc@0.75 (strict threshold)
+            metrics.acc_at_075 = metrics.n_acc_075_correct / metrics.n_samples_with_gt
+            # Recall@5: GT in top-5 predictions
+            metrics.recall_at_5 = metrics.n_recall_5_correct / metrics.n_samples_with_gt
+            # Recall@10: GT in top-10 predictions
+            metrics.recall_at_10 = metrics.n_recall_10_correct / metrics.n_samples_with_gt
+        
+        # Mean IoU
+        if metrics.n_iou_computed > 0:
+            metrics.mean_iou = metrics.sum_iou / metrics.n_iou_computed
     
     def accumulate(self, batch_metrics: GroundingMetrics):
         """Accumulate batch metrics into running totals."""
@@ -306,6 +451,14 @@ class MetricsComputer:
         self._n_keypoints_evaluated += batch_metrics.n_keypoints_evaluated
         self._n_keypoints_correct += batch_metrics.n_keypoints_correct
         self._sum_loss += batch_metrics.sum_loss
+        # IoU-based metrics accumulators
+        self._n_acc_025_correct += batch_metrics.n_acc_025_correct
+        self._n_acc_050_correct += batch_metrics.n_acc_050_correct
+        self._n_acc_075_correct += batch_metrics.n_acc_075_correct
+        self._sum_iou += batch_metrics.sum_iou
+        self._n_iou_computed += batch_metrics.n_iou_computed
+        self._n_recall_5_correct += batch_metrics.n_recall_5_correct
+        self._n_recall_10_correct += batch_metrics.n_recall_10_correct
     
     def get_accumulated_metrics(self) -> GroundingMetrics:
         """Get accumulated metrics over all batches."""
@@ -323,6 +476,14 @@ class MetricsComputer:
         metrics.n_keypoints_evaluated = self._n_keypoints_evaluated
         metrics.n_keypoints_correct = self._n_keypoints_correct
         metrics.sum_loss = self._sum_loss
+        # IoU-based metrics accumulators
+        metrics.n_acc_025_correct = self._n_acc_025_correct
+        metrics.n_acc_050_correct = self._n_acc_050_correct
+        metrics.n_acc_075_correct = self._n_acc_075_correct
+        metrics.sum_iou = self._sum_iou
+        metrics.n_iou_computed = self._n_iou_computed
+        metrics.n_recall_5_correct = self._n_recall_5_correct
+        metrics.n_recall_10_correct = self._n_recall_10_correct
         
         self._finalize_metrics(metrics)
         return metrics
@@ -404,24 +565,40 @@ def format_metrics_table(metrics: GroundingMetrics, title: str = "Metrics") -> s
     """Format metrics as a nice ASCII table."""
     lines = [
         "",
-        "=" * 60,
+        "=" * 70,
         f" {title}",
-        "=" * 60,
-        f"  {'Metric':<30} {'Value':>15}",
-        "-" * 60,
-        f"  {'Loss':<30} {metrics.loss:>15.4f}",
-        f"  {'Margin Success Rate':<30} {metrics.margin_success_rate*100:>14.2f}%",
-        f"  {'Accuracy@1':<30} {metrics.accuracy_at_1*100:>14.2f}%",
-        f"  {'Mean GT Rank':<30} {metrics.mean_gt_rank:>15.2f}",
-        f"  {'PCK@50':<30} {metrics.pck_50*100:>14.2f}%",
-        # Rejection accuracy disabled: dataset contains no rejection samples
-        # f"  {'Rejection Accuracy':<30} {metrics.rejection_accuracy*100:>14.2f}%",
-        f"  {'Avg GT Score':<30} {metrics.avg_gt_score:>15.4f}",
-        f"  {'Avg Max Neg Score':<30} {metrics.avg_max_neg_score:>15.4f}",
-        "-" * 60,
-        f"  {'Samples Total':<30} {metrics.n_samples:>15}",
-        f"  {'Samples with GT':<30} {metrics.n_samples_with_gt:>15}",
-        f"  {'Samples without GT':<30} {metrics.n_samples_without_gt:>15}",
-        "=" * 60,
+        "=" * 70,
+        f"  {'Metric':<35} {'Value':>20}",
+        "-" * 70,
+        "",
+        "  CORE METRICS (Custom)",
+        "-" * 70,
+        f"  {'Loss':<35} {metrics.loss:>20.4f}",
+        f"  {'Margin Success Rate':<35} {metrics.margin_success_rate*100:>19.2f}%",
+        f"  {'Accuracy@1':<35} {metrics.accuracy_at_1*100:>19.2f}%",
+        f"  {'Mean GT Rank':<35} {metrics.mean_gt_rank:>20.2f}",
+        "",
+        "  STANDARD GROUNDING METRICS (RefCOCO)",
+        "-" * 70,
+        f"  {'Acc@0.25 (lenient)':<35} {metrics.acc_at_025*100:>19.2f}%",
+        f"  {'Acc@0.5 (standard)':<35} {metrics.acc_at_050*100:>19.2f}%",
+        f"  {'Acc@0.75 (strict)':<35} {metrics.acc_at_075*100:>19.2f}%",
+        f"  {'Mean IoU':<35} {metrics.mean_iou*100:>19.2f}%",
+        f"  {'Recall@5':<35} {metrics.recall_at_5*100:>19.2f}%",
+        f"  {'Recall@10':<35} {metrics.recall_at_10*100:>19.2f}%",
+        "",
+        "  HUMAN-CENTRIC METRICS",
+        "-" * 70,
+        f"  {'PCK@50':<35} {metrics.pck_50*100:>19.2f}%",
+        f"  {'Avg GT Score':<35} {metrics.avg_gt_score:>20.4f}",
+        f"  {'Avg Max Neg Score':<35} {metrics.avg_max_neg_score:>20.4f}",
+        "-" * 70,
+        "",
+        "  SAMPLE COUNTS",
+        "-" * 70,
+        f"  {'Samples Total':<35} {metrics.n_samples:>20}",
+        f"  {'Samples with GT':<35} {metrics.n_samples_with_gt:>20}",
+        f"  {'Samples without GT':<35} {metrics.n_samples_without_gt:>20}",
+        "=" * 70,
     ]
     return "\n".join(lines)

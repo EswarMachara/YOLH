@@ -455,6 +455,95 @@ def compute_sample_id_for_cache(image_id: str, ann_id: int, caption: str) -> str
     return f"{image_id}_{ann_id}_{cap_hash}"
 
 
+# =============================================================================
+# PERSISTENT SPLIT FILE SYSTEM
+# =============================================================================
+# Ensures identical train/val/test splits across ALL experiments, regardless
+# of hardware, platform, filesystem ordering, or run order.
+
+def load_split_file(split_file: Path) -> Optional[Dict[str, set]]:
+    """
+    Load split assignments from a JSON file.
+    
+    Returns:
+        Dict mapping split names to sets of sample_ids, or None if file doesn't exist.
+    """
+    if not split_file.exists():
+        return None
+    
+    try:
+        with open(split_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Convert lists to sets for O(1) lookup
+        split_assignments = {
+            'train': set(data['splits']['train']),
+            'val': set(data['splits']['val']),
+            'test': set(data['splits']['test']),
+        }
+        
+        metadata = data.get('metadata', {})
+        total_samples = len(split_assignments['train']) + len(split_assignments['val']) + len(split_assignments['test'])
+        
+        print(f"\n  [SPLIT FILE] Loaded persistent splits from: {split_file}")
+        print(f"    Created: {metadata.get('created', 'unknown')}")
+        print(f"    Original seed: {metadata.get('seed', 'unknown')}")
+        print(f"    Total samples in file: {total_samples:,}")
+        print(f"    Train: {len(split_assignments['train']):,} | Val: {len(split_assignments['val']):,} | Test: {len(split_assignments['test']):,}")
+        
+        return split_assignments
+    
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"  [WARNING] Failed to load split file {split_file}: {e}")
+        return None
+
+
+def save_split_file(
+    split_file: Path, 
+    sample_ids_by_split: Dict[str, List[str]], 
+    seed: int, 
+    ratios: Dict[str, float]
+) -> None:
+    """
+    Save split assignments to a JSON file for reproducibility.
+    
+    Args:
+        split_file: Path to save the JSON file
+        sample_ids_by_split: Dict mapping split name to list of sample_ids
+        seed: Random seed used for splitting
+        ratios: Dict of split ratios (train, val, test)
+    """
+    from datetime import datetime
+    
+    total = sum(len(ids) for ids in sample_ids_by_split.values())
+    
+    data = {
+        'metadata': {
+            'created': datetime.now().isoformat(),
+            'seed': seed,
+            'ratios': ratios,
+            'total_samples': total,
+            'description': 'Persistent train/val/test split assignments for RefYOLO-Human experiments. DO NOT MODIFY.',
+        },
+        'splits': {
+            'train': sample_ids_by_split['train'],
+            'val': sample_ids_by_split['val'],
+            'test': sample_ids_by_split['test'],
+        }
+    }
+    
+    # Ensure directory exists
+    split_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(split_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"\n  [SPLIT FILE] Saved persistent splits to: {split_file}")
+    print(f"    Total samples: {total:,}")
+    print(f"    Train: {len(sample_ids_by_split['train']):,} | Val: {len(sample_ids_by_split['val']):,} | Test: {len(sample_ids_by_split['test']):,}")
+    print(f"    [INFO] This file ensures identical splits across ALL future experiments.")
+
+
 class CachedFeatureDataset(Dataset):
     """Dataset that loads precomputed YOLO features from cache."""
     
@@ -466,10 +555,12 @@ class CachedFeatureDataset(Dataset):
         split_config: Optional[Dict] = None,
         max_samples: Optional[int] = None,
         seed: int = 42,
+        split_file: Optional[Path] = None,
     ):
         self.cache_dir = cache_dir
         self.seed = seed
         self.split = split
+        self.split_file = split_file
         self.split_config = split_config or {'train': 0.8, 'val': 0.1, 'test': 0.1, 'seed': 42}
         
         total_ratio = self.split_config['train'] + self.split_config['val'] + self.split_config['test']
@@ -527,13 +618,21 @@ class CachedFeatureDataset(Dataset):
         
         print(f"  Total valid samples: {len(self._all_samples)}")
         
+        # Build sample_id to index mapping for file-based splits
+        self._sample_id_to_idx = {s['sample_id']: i for i, s in enumerate(self._all_samples)}
+        
         cache_key = str(coco_json_path.resolve())
         
-        if cache_key not in _CACHED_SPLIT_INDICES:
-            self._compute_splits()
+        # Priority: 1) Memory cache  2) Split file  3) Generate new
+        if cache_key in _CACHED_SPLIT_INDICES:
+            self._split_indices = _CACHED_SPLIT_INDICES[cache_key]
+            print(f"  [SPLIT] Using cached in-memory splits")
+        elif self.split_file is not None:
+            self._load_or_create_split_file()
             _CACHED_SPLIT_INDICES[cache_key] = self._split_indices
         else:
-            self._split_indices = _CACHED_SPLIT_INDICES[cache_key]
+            self._compute_splits()
+            _CACHED_SPLIT_INDICES[cache_key] = self._split_indices
         
         if self.split is None:
             self.samples = self._all_samples
@@ -590,6 +689,89 @@ class CachedFeatureDataset(Dataset):
         total_split = len(train_ids) + len(val_ids) + len(test_ids)
         if total_split != n_total:
             raise RuntimeError(f"[SPLIT ERROR] {total_split} != {n_total}")
+    
+    def _load_or_create_split_file(self):
+        """
+        Load splits from file if exists, otherwise create and save them.
+        
+        This ensures IDENTICAL splits across all experiments, regardless of
+        hardware, platform, filesystem ordering, or run order.
+        """
+        # Try to load existing split file
+        loaded_splits = load_split_file(self.split_file)
+        
+        if loaded_splits is not None:
+            # Map sample_ids back to indices
+            train_indices = []
+            val_indices = []
+            test_indices = []
+            
+            samples_found = 0
+            samples_missing = 0
+            
+            for sample_id, idx in self._sample_id_to_idx.items():
+                if sample_id in loaded_splits['train']:
+                    train_indices.append(idx)
+                    samples_found += 1
+                elif sample_id in loaded_splits['val']:
+                    val_indices.append(idx)
+                    samples_found += 1
+                elif sample_id in loaded_splits['test']:
+                    test_indices.append(idx)
+                    samples_found += 1
+                else:
+                    # New sample not in split file - assign to train by default
+                    train_indices.append(idx)
+                    samples_missing += 1
+            
+            if samples_missing > 0:
+                print(f"  [WARNING] {samples_missing} new samples not in split file - assigned to train")
+            
+            self._split_indices = {
+                "train": train_indices,
+                "val": val_indices,
+                "test": test_indices,
+            }
+            
+            # Verify no leakage
+            self._verify_no_leakage()
+            
+        else:
+            # Generate new splits and save to file
+            print(f"  [SPLIT FILE] No existing split file found. Generating new splits...")
+            self._compute_splits()
+            
+            # Extract sample_ids for saving
+            sample_ids_by_split = {
+                'train': [self._all_samples[i]['sample_id'] for i in self._split_indices['train']],
+                'val': [self._all_samples[i]['sample_id'] for i in self._split_indices['val']],
+                'test': [self._all_samples[i]['sample_id'] for i in self._split_indices['test']],
+            }
+            
+            # Save to file
+            save_split_file(
+                self.split_file,
+                sample_ids_by_split,
+                self.split_config['seed'],
+                {
+                    'train': self.split_config['train'],
+                    'val': self.split_config['val'],
+                    'test': self.split_config['test'],
+                }
+            )
+    
+    def _verify_no_leakage(self):
+        """Verify no sample appears in multiple splits."""
+        train_ids = {self._all_samples[i]['sample_id'] for i in self._split_indices['train']}
+        val_ids = {self._all_samples[i]['sample_id'] for i in self._split_indices['val']}
+        test_ids = {self._all_samples[i]['sample_id'] for i in self._split_indices['test']}
+        
+        if train_ids & val_ids:
+            raise RuntimeError("[LEAKAGE] Samples in both train and val!")
+        if train_ids & test_ids:
+            raise RuntimeError("[LEAKAGE] Samples in both train and test!")
+        if val_ids & test_ids:
+            raise RuntimeError("[LEAKAGE] Samples in both val and test!")
     
     def _print_split_stats(self):
         total = len(self._all_samples)
@@ -944,6 +1126,12 @@ def _run_training_loop(
     print(f"    Test:  {split_config['test']:.0%}")
     print(f"    Seed:  {split_config['seed']}")
     
+    # Resolve split file path (if configured)
+    split_file = None
+    if hasattr(config.splits, 'split_file') and config.splits.split_file:
+        split_file = Path(config.splits.split_file)
+        print(f"    Split file: {split_file}")
+    
     # Create TRAIN dataset
     print("\n  Creating TRAIN dataset...")
     train_dataset = CachedFeatureDataset(
@@ -953,6 +1141,7 @@ def _run_training_loop(
         split_config=split_config,
         max_samples=None,
         seed=config.runtime.seed,
+        split_file=split_file,
     )
     
     train_dataloader = DataLoader(
@@ -973,6 +1162,7 @@ def _run_training_loop(
         split_config=split_config,
         max_samples=None,
         seed=config.runtime.seed,
+        split_file=split_file,
     )
     
     val_dataloader = DataLoader(

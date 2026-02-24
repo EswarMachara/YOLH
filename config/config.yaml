@@ -92,6 +92,16 @@ splits:
   test: 0.1
   # Seed for deterministic shuffling (separate from runtime seed)
   seed: 42
+  # ==========================================================================
+  # PERSISTENT SPLIT FILE (for reproducibility across experiments)
+  # ==========================================================================
+  # Path to JSON file storing sample-to-split assignments.
+  # - If file exists: splits are loaded from it (ratios/seed ignored)
+  # - If file doesn't exist: splits are generated and saved to this file
+  # This ensures IDENTICAL train/val/test splits across ALL experiments,
+  # regardless of hardware, platform, or run order.
+  # Set to null to disable (use in-memory splits with seed only)
+  split_file: config/data_splits.json
 
 # =============================================================================
 # GROUNDING ADAPTER CONFIGURATION

@@ -359,6 +359,12 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
         'seed': config.splits.seed,
     }
     
+    # Resolve split file path (if configured)
+    split_file = None
+    if hasattr(config.splits, 'split_file') and config.splits.split_file:
+        split_file = Path(config.splits.split_file)
+        print(f"  Using persistent split file: {split_file}")
+    
     test_dataset = CachedFeatureDataset(
         cache_dir=cache_dir,
         coco_json_path=coco_json,
@@ -366,6 +372,7 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
         split_config=split_config,
         max_samples=None,
         seed=config.runtime.seed,
+        split_file=split_file,
     )
     
     eval_batch_size = batch_size or config.training.batch_size

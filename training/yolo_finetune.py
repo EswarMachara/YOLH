@@ -336,36 +336,60 @@ def train_seg_model(
     return final_path
 
 
-def main():
-    """Main entry point for YOLO fine-tuning."""
-    parser = argparse.ArgumentParser(
-        description="Fine-tune YOLO pose and segmentation models"
-    )
-    add_config_argument(parser)
-    parser.add_argument(
-        "--pose-only",
-        action="store_true",
-        help="Train only pose model"
-    )
-    parser.add_argument(
-        "--seg-only",
-        action="store_true",
-        help="Train only segmentation model"
-    )
-    parser.add_argument(
-        "--skip-dataset-build",
-        action="store_true",
-        help="Skip dataset building (use existing)"
-    )
-    args = parser.parse_args()
+def main(config_override: Optional[Config] = None):
+    """
+    Main entry point for YOLO fine-tuning.
     
-    print("=" * 60)
-    print("YOLO FINE-TUNING FOR RefYOLO-Human")
-    print("=" * 60)
-    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Load config
-    config = load_config(args.config)
+    Args:
+        config_override: Optional Config object. If provided, uses this instead
+                        of loading from CLI args. Useful for notebook usage.
+    """
+    # If config provided, skip CLI parsing
+    if config_override is not None:
+        config = config_override
+        print("=" * 60)
+        print("YOLO FINE-TUNING FOR RefYOLO-Human")
+        print("=" * 60)
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("(Using provided config object)")
+        
+        # Set defaults for notebook mode
+        args_pose_only = False
+        args_seg_only = False
+        args_skip_dataset_build = False
+    else:
+        # CLI mode
+        parser = argparse.ArgumentParser(
+            description="Fine-tune YOLO pose and segmentation models"
+        )
+        add_config_argument(parser)
+        parser.add_argument(
+            "--pose-only",
+            action="store_true",
+            help="Train only pose model"
+        )
+        parser.add_argument(
+            "--seg-only",
+            action="store_true",
+            help="Train only segmentation model"
+        )
+        parser.add_argument(
+            "--skip-dataset-build",
+            action="store_true",
+            help="Skip dataset building (use existing)"
+        )
+        args = parser.parse_args()
+        
+        print("=" * 60)
+        print("YOLO FINE-TUNING FOR RefYOLO-Human")
+        print("=" * 60)
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Load config
+        config = load_config(args.config)
+        args_pose_only = args.pose_only
+        args_seg_only = args.seg_only
+        args_skip_dataset_build = args.skip_dataset_build
     
     # Validate settings
     print("\n[VALIDATION]")
@@ -401,7 +425,7 @@ def main():
     # Build YOLO dataset
     dataset_dir = output_dir / 'dataset'
     
-    if not args.skip_dataset_build:
+    if not args_skip_dataset_build:
         print("\n[BUILDING YOLO DATASET]")
         split_config = {
             'train': config.splits.train,
@@ -434,10 +458,10 @@ def main():
     pose_path = None
     seg_path = None
     
-    if not args.seg_only:
+    if not args_seg_only:
         pose_path = train_pose_model(config, pose_yaml, output_dir)
     
-    if not args.pose_only:
+    if not args_pose_only:
         seg_path = train_seg_model(config, seg_yaml, output_dir)
     
     # Final summary
@@ -452,11 +476,15 @@ def main():
     
     print(f"\nFinished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    print("\n[NEXT STEPS]")
-    print("  1. Re-cache features with fine-tuned weights:")
-    print(f"     python vision/cache_yolo_features.py --config {args.config}")
-    print("  2. Train grounding components:")
-    print(f"     python training/grounding_train_cached.py --config {args.config}")
+    if config_override is None:
+        # CLI mode - print next steps
+        print("\n[NEXT STEPS]")
+        print("  1. Re-cache features with fine-tuned weights:")
+        print(f"     python vision/cache_yolo_features.py --config config/config.yaml")
+        print("  2. Train grounding components:")
+        print(f"     python training/grounding_train_cached.py --config config/config.yaml")
+    
+    return pose_path, seg_path
 
 
 if __name__ == "__main__":
