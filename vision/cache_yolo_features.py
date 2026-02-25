@@ -307,6 +307,8 @@ def cache_yolo_features(config: Config):
     Args:
         config: Configuration object with paths and settings.
     """
+    import json as _json
+    
     print("\n" + "=" * 70)
     print("YOLO FEATURE CACHING FOR RefYOLO-Human TRAINING")
     print("=" * 70)
@@ -333,12 +335,45 @@ def cache_yolo_features(config: Config):
     cache_dir.mkdir(exist_ok=True)
     print(f"\nCache directory: {cache_dir}")
     
+    # ==========================================================================
+    # STEP 0: Load annotations to build file_name → image_id mapping
+    # ==========================================================================
+    # The annotation image_id (sequential int) is used as the canonical ID for
+    # cache filenames and downstream dataset lookups. The disk filenames (which
+    # may be zero-padded numbers or hex strings) are NOT reliable as integer IDs.
+    print("\n" + "-" * 50)
+    print("STEP 0: Building file_name → image_id mapping from annotations")
+    print("-" * 50)
+    
+    annotations_path = config.annotations_path
+    print(f"  Loading annotations from: {annotations_path}")
+    with open(annotations_path, 'r') as f:
+        coco_data = _json.load(f)
+    
+    # Build mapping: disk filename → annotation integer image_id
+    filename_to_image_id = {}
+    for img_entry in coco_data['images']:
+        filename_to_image_id[img_entry['file_name']] = img_entry['id']
+    
+    print(f"  Annotations contain {len(filename_to_image_id)} images")
+    
+    # Free the large annotations dict (we only need the filename mapping)
+    del coco_data
+    
     # Get all image files
     image_files = sorted(images_dir.glob("*.jpg"))
-    print(f"Found {len(image_files)} images in {images_dir}")
+    print(f"\nFound {len(image_files)} images in {images_dir}")
+    
+    # Filter to only images that have annotations
+    image_files_with_anns = [f for f in image_files if f.name in filename_to_image_id]
+    skipped_no_ann = len(image_files) - len(image_files_with_anns)
+    if skipped_no_ann > 0:
+        print(f"  Skipping {skipped_no_ann} images without annotations")
+    image_files = image_files_with_anns
+    print(f"  Processing {len(image_files)} annotated images")
     
     if len(image_files) == 0:
-        print("ERROR: No images found!")
+        print("ERROR: No annotated images found!")
         return
     
     # ==========================================================================
@@ -432,6 +467,7 @@ def cache_yolo_features(config: Config):
     stats = {
         "total_images": len(image_files),
         "processed": 0,
+        "skipped_existing": 0,
         "total_humans": 0,
         "images_with_humans": 0,
         "failed": 0,
@@ -442,9 +478,17 @@ def cache_yolo_features(config: Config):
     
     for img_path in tqdm(image_files, desc="Caching features"):
         try:
-            # Extract image_id from filename (e.g., "100000.jpg" -> 100000)
-            image_id = int(img_path.stem)
+            # Look up annotation image_id from the filename → ID mapping
+            # This handles ALL filename formats (zero-padded numbers, hex strings, etc.)
             file_name = img_path.name
+            image_id = filename_to_image_id[file_name]  # annotation integer ID
+            
+            # Skip if already cached (supports resume after interruption)
+            cache_path = cache_dir / f"{image_id}.pt"
+            if cache_path.exists():
+                stats["skipped_existing"] += 1
+                stats["processed"] += 1
+                continue
             
             # Run YOLO inference (pose)
             with torch.no_grad():
@@ -556,8 +600,7 @@ def cache_yolo_features(config: Config):
                     assert value.device == torch.device('cpu'), \
                         f"CACHE ERROR: Tensor '{key}' is on {value.device}, must be on CPU for disk storage"
             
-            # Save cache
-            cache_path = cache_dir / f"{image_id}.pt"
+            # Save cache (cache_path already set at top of loop)
             torch.save(cache_data, cache_path)
             
             stats["processed"] += 1
@@ -659,6 +702,7 @@ def cache_yolo_features(config: Config):
     │                    FEATURE CACHE SUMMARY                        │
     ├─────────────────────────────────────────────────────────────────┤
     │ Images processed:        {stats['processed']:>6} / {stats['total_images']:<6}                    │
+    │ Skipped (already cached):{stats['skipped_existing']:>6}                                  │
     │ Images with humans:      {stats['images_with_humans']:>6}                                  │
     │ Total humans detected:   {stats['total_humans']:>6}                                  │
     │ Average humans/image:    {stats['total_humans']/max(stats['images_with_humans'],1):>6.2f}                                  │
@@ -666,13 +710,13 @@ def cache_yolo_features(config: Config):
     │ NaN/Inf warnings:        {stats['nan_inf_count']:>6}                                  │
     ├─────────────────────────────────────────────────────────────────┤
     │ Processing time:         {elapsed:>6.1f} seconds                           │
-    │ Time per image:          {elapsed/max(stats['processed'],1):>6.2f} seconds                           │
+    │ Time per image:          {elapsed/max(stats['processed']-stats['skipped_existing'],1):>6.2f} seconds                           │
     │ Cache size:              {total_size:>6.1f} MB                                 │
     │ Cache directory:         {str(cache_dir):<40}│
     ├─────────────────────────────────────────────────────────────────┤
     │ Cache format per image:                                         │
-    │   - image_id: int                                               │
-    │   - file_name: str                                              │
+    │   - image_id: int (annotation ID)                               │
+    │   - file_name: str (disk filename)                              │
     │   - boxes: Tensor[N, 4]        (normalized xyxy)                │
     │   - masks: Tensor[N, 160, 160] (resized)                        │
     │   - keypoints: Tensor[N, 17, 3] (normalized)                    │
