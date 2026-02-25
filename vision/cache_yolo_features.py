@@ -7,7 +7,7 @@ components (adapter + scorer + MIRL loss) without running YOLO in the loop.
 
 Cache Format (per image):
 {
-    "image_id": str,
+    "image_id": int,
     "file_name": str,
     "boxes": Tensor[N, 4],           # normalized xyxy [0,1]
     "masks": Tensor[N, 160, 160],    # resized segmentation masks
@@ -442,8 +442,8 @@ def cache_yolo_features(config: Config):
     
     for img_path in tqdm(image_files, desc="Caching features"):
         try:
-            # Extract image_id from filename (e.g., "100000.jpg" -> "100000", "0315b998baa2b3ad.jpg" -> "0315b998baa2b3ad")
-            image_id = img_path.stem  # Keep as string to support hex/alphanumeric IDs
+            # Extract image_id from filename (e.g., "100000.jpg" -> 100000)
+            image_id = int(img_path.stem)
             file_name = img_path.name
             
             # Run YOLO inference (pose)
@@ -671,7 +671,7 @@ def cache_yolo_features(config: Config):
     │ Cache directory:         {str(cache_dir):<40}│
     ├─────────────────────────────────────────────────────────────────┤
     │ Cache format per image:                                         │
-    │   - image_id: str                                               │
+    │   - image_id: int                                               │
     │   - file_name: str                                              │
     │   - boxes: Tensor[N, 4]        (normalized xyxy)                │
     │   - masks: Tensor[N, 160, 160] (resized)                        │
