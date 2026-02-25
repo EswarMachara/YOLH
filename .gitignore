@@ -22,8 +22,7 @@ cache/
 checkpoints/
 data/images/
 data/images_200/
-data/annotations*.json
-*.json 
+data/annotations*.json 
 images_200
 docs/*
 
