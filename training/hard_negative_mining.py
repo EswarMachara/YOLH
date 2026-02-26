@@ -481,64 +481,49 @@ class WeightedMIRLLoss(nn.Module):
         negative_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute weighted MIRL loss.
-        
+        Compute weighted MIRL loss (vectorised — no Python loop).
+
         Args:
             scores: [B, N] predicted scores
             gt_indices: [B] ground truth indices
             valid: [B, N] validity mask
             negative_weights: [B, N] optional per-negative weights
-        
+
         Returns:
             Dictionary with 'total', 'ranking', 'rejection' losses
         """
         B, N = scores.shape
         device = scores.device
-        
+
         if negative_weights is None or not self.use_weights:
             negative_weights = torch.ones(B, N, device=device)
-        
-        total_ranking_loss = torch.tensor(0.0, device=device)
+
+        # --- valid sample mask -----------------------------------------------
+        gt_clamped = gt_indices.clamp(0, N - 1)                       # [B]
+        in_range = (gt_indices >= 0) & (gt_indices < N)                # [B]
+        gt_is_valid = valid.gather(1, gt_clamped.unsqueeze(1)).squeeze(1)
+        sample_ok = in_range & gt_is_valid                             # [B]
+        n_valid = sample_ok.float().sum().clamp(min=1)
+
+        # --- positive scores -------------------------------------------------
+        pos_scores = scores.gather(1, gt_clamped.unsqueeze(1)).squeeze(1)  # [B]
+
+        # --- negative mask [B, N] --------------------------------------------
+        neg_mask = valid.clone()
+        neg_mask.scatter_(1, gt_clamped.unsqueeze(1), False)
+        neg_count = neg_mask.float().sum(dim=1).clamp(min=1)           # [B]
+
+        # --- weighted ranking loss -------------------------------------------
+        margin_diff = self.margin - (pos_scores.unsqueeze(1) - scores) # [B,N]
+        rank_elem = torch.relu(margin_diff) * neg_mask.float()         # [B,N]
+        rank_elem = rank_elem * negative_weights                       # apply HNM weights
+        rank_per_sample = rank_elem.sum(dim=1) / neg_count             # [B]
+        rank_per_sample = rank_per_sample * sample_ok.float()
+
+        total_ranking_loss = rank_per_sample.sum() / n_valid
         total_rejection_loss = torch.tensor(0.0, device=device)
-        valid_samples = 0
-        
-        for b in range(B):
-            gt_idx = gt_indices[b].item()
-            valid_mask = valid[b]
-            sample_scores = scores[b]
-            sample_weights = negative_weights[b]
-            
-            # Skip invalid GT
-            if gt_idx < 0 or gt_idx >= N or not valid_mask[gt_idx]:
-                continue
-            
-            valid_samples += 1
-            pos_score = sample_scores[gt_idx]
-            
-            # Get negative mask
-            neg_mask = valid_mask.clone()
-            neg_mask[gt_idx] = False
-            
-            if neg_mask.any():
-                neg_scores = sample_scores[neg_mask]
-                neg_weights_selected = sample_weights[neg_mask]
-                
-                # Weighted ranking loss: margin - (pos - neg), weighted by difficulty
-                margins = pos_score - neg_scores
-                losses = torch.relu(self.margin - margins)
-                
-                # Apply weights (hard negatives contribute more)
-                weighted_losses = losses * neg_weights_selected
-                ranking_loss = weighted_losses.mean()
-                
-                total_ranking_loss = total_ranking_loss + ranking_loss
-        
-        # Normalize
-        if valid_samples > 0:
-            total_ranking_loss = total_ranking_loss / valid_samples
-        
         total_loss = total_ranking_loss + self.lambda_reject * total_rejection_loss
-        
+
         return {
             "total": total_loss,
             "ranking": total_ranking_loss,

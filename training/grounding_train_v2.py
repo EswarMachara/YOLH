@@ -24,6 +24,9 @@ USAGE:
     python training/grounding_train_cached.py --config config/config.yaml
 """
 
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Prevent fork warning with num_workers>0
+
 import sys
 from pathlib import Path
 
@@ -31,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
 import random
+import concurrent.futures
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -312,47 +316,107 @@ class MIRLLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         B, N = scores.shape
         device = scores.device
-        
-        total_ranking_loss = torch.tensor(0.0, device=device)
-        total_rejection_loss = torch.tensor(0.0, device=device)
-        valid_samples = 0
-        
-        for b in range(B):
-            gt_idx = gt_indices[b].item()
-            valid_mask = valid[b]
-            sample_scores = scores[b]
-            
-            if gt_idx < 0 or gt_idx >= N or not valid_mask[gt_idx]:
-                continue
-            
-            valid_samples += 1
-            
-            pos_score = sample_scores[gt_idx]
-            
-            neg_mask = valid_mask.clone()
-            neg_mask[gt_idx] = False
-            
-            if neg_mask.any():
-                neg_scores = sample_scores[neg_mask]
-                margins = pos_score - neg_scores
-                ranking_loss = torch.relu(self.margin - margins).mean()
-                total_ranking_loss = total_ranking_loss + ranking_loss
-            
-            valid_scores = sample_scores[valid_mask]
-            rejection_loss = torch.relu(-valid_scores).mean()
-            total_rejection_loss = total_rejection_loss + rejection_loss
-        
-        if valid_samples > 0:
-            total_ranking_loss = total_ranking_loss / valid_samples
-            total_rejection_loss = total_rejection_loss / valid_samples
-        
+
+        # --- identify valid samples (gt in range AND gt slot is valid) -------
+        gt_clamped = gt_indices.clamp(0, N - 1)                       # [B]
+        in_range = (gt_indices >= 0) & (gt_indices < N)                # [B]
+        gt_valid = valid.gather(1, gt_clamped.unsqueeze(1)).squeeze(1) # [B]
+        sample_ok = in_range & gt_valid                                # [B]
+        n_valid = sample_ok.float().sum().clamp(min=1)
+
+        # --- positive scores [B] --------------------------------------------
+        pos_scores = scores.gather(1, gt_clamped.unsqueeze(1)).squeeze(1)
+
+        # --- negative mask [B, N]: valid slots minus gt ----------------------
+        neg_mask = valid.clone()
+        neg_mask.scatter_(1, gt_clamped.unsqueeze(1), False)
+        neg_count = neg_mask.float().sum(dim=1).clamp(min=1)           # [B]
+
+        # --- ranking loss (vectorised) ---------------------------------------
+        #  relu(margin - (pos - neg))  averaged over negatives per sample
+        margin_diff = self.margin - (pos_scores.unsqueeze(1) - scores) # [B,N]
+        rank_elem = torch.relu(margin_diff) * neg_mask.float()         # [B,N]
+        rank_per_sample = rank_elem.sum(dim=1) / neg_count             # [B]
+        rank_per_sample = rank_per_sample * sample_ok.float()
+
+        # --- rejection loss (vectorised) -------------------------------------
+        rej_elem = torch.relu(-scores) * valid.float()                 # [B,N]
+        valid_count = valid.float().sum(dim=1).clamp(min=1)            # [B]
+        rej_per_sample = rej_elem.sum(dim=1) / valid_count             # [B]
+        rej_per_sample = rej_per_sample * sample_ok.float()
+
+        # --- aggregate -------------------------------------------------------
+        total_ranking_loss = rank_per_sample.sum() / n_valid
+        total_rejection_loss = rej_per_sample.sum() / n_valid
         total = total_ranking_loss + self.lambda_reject * total_rejection_loss
-        
+
         return {
             "total": total,
             "ranking": total_ranking_loss,
             "rejection": total_rejection_loss,
         }
+
+
+# =============================================================================
+# CAPTION PRE-ENCODING
+# =============================================================================
+
+@torch.no_grad()
+def precompute_caption_embeddings(
+    datasets: List["CachedFeatureDataset"],
+    query_encoder: "SimpleQueryEncoder",
+    device: str,
+    use_token_level: bool = False,
+    encode_batch_size: int = 256,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """
+    Pre-encode ALL unique captions into a CPU-resident lookup dict.
+
+    This eliminates per-batch MiniLM inference during training / validation.
+    Sentence-level embeddings are always pre-encoded.  Token-level embeddings
+    are skipped (too large for RAM) — those still use a live encoder call.
+
+    Args:
+        datasets: List of CachedFeatureDataset instances (train + val).
+        query_encoder: Frozen SimpleQueryEncoder already on *device*.
+        device: CUDA / CPU device string.
+        use_token_level: Informational flag (printed but not used — tokens
+            are NOT pre-encoded due to memory).
+        encode_batch_size: How many captions to encode at once.
+
+    Returns:
+        Dict  mapping  caption_string → {'sentence': Tensor[256]}
+        (all tensors on CPU).
+    """
+    # Collect unique captions across all supplied datasets
+    unique_captions: set = set()
+    for ds in datasets:
+        for s in ds.samples:
+            unique_captions.add(s['caption'])
+    unique_list = sorted(unique_captions)          # sort for reproducibility
+
+    mem_mb = len(unique_list) * 256 * 4 / (1024 ** 2)
+    print(f"\n  [PRE-ENCODE] Unique captions: {len(unique_list):,}")
+    print(f"  [PRE-ENCODE] Estimated sentence-embedding RAM: {mem_mb:.1f} MB")
+    if use_token_level:
+        print(f"  [PRE-ENCODE] Token-level embeddings are NOT pre-encoded (too large).")
+        print(f"               forward_tokens_batch() will still run per batch.")
+
+    cache: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    query_encoder.eval()
+    for i in tqdm(
+        range(0, len(unique_list), encode_batch_size),
+        desc="  Pre-encoding captions",
+    ):
+        batch_caps = unique_list[i : i + encode_batch_size]
+        sent_emb = query_encoder.forward_batch(batch_caps)      # [B, 256] GPU
+        sent_emb_cpu = sent_emb.cpu()
+        for j, cap in enumerate(batch_caps):
+            cache[cap] = {'sentence': sent_emb_cpu[j]}
+
+    print(f"  [PRE-ENCODE] Done — {len(cache):,} embeddings cached on CPU.\n")
+    return cache
 
 
 # =============================================================================
@@ -653,7 +717,7 @@ class CachedFeatureDataset(Dataset):
         self._print_split_stats()
         
         self._cache = {}
-        self._cache_max_size = 100
+        self._cache_max_size = 5000
     
     def _compute_splits(self):
         n_total = len(self._all_samples)
@@ -787,6 +851,45 @@ class CachedFeatureDataset(Dataset):
         print(f"    [PASS] Sample-level split complete")
         print(f"    [PASS] No leakage detected")
     
+    def preload_to_ram(self):
+        """
+        Preload ALL cache .pt files referenced by this split into RAM.
+
+        Eliminates disk I/O during training.  Must be called BEFORE the
+        DataLoader workers are forked (i.e., before the first iteration).
+        With fork-based multiprocessing (Linux default), workers inherit
+        the preloaded ``_cache`` dict via copy-on-write at zero cost.
+        """
+        # Collect unique cache files referenced by this split's samples
+        unique_files: Dict[str, Path] = {}
+        for sample in self.samples:
+            key = str(sample['cache_file'])
+            if key not in self._cache and key not in unique_files:
+                unique_files[key] = sample['cache_file']
+
+        if not unique_files:
+            print(f"  [PRELOAD] All cache files already in RAM")
+            return
+
+        print(f"  [PRELOAD] Loading {len(unique_files):,} .pt files into RAM "
+              f"({len(self.samples):,} samples in split)...")
+
+        def _load_one(args):
+            key, path = args
+            return key, torch.load(path, weights_only=True)
+
+        loaded = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for key, data in pool.map(_load_one, unique_files.items()):
+                self._cache[key] = data
+                loaded += 1
+
+        # Prevent any eviction now that everything lives in RAM
+        self._cache_max_size = len(self._cache) + 100_000
+
+        size_gb = sum(f.stat().st_size for f in unique_files.values()) / (1024 ** 3)
+        print(f"  [PRELOAD] Done — {loaded:,} files loaded ({size_gb:.1f} GB in RAM)")
+
     def __len__(self) -> int:
         return len(self.samples)
     
@@ -888,6 +991,7 @@ def validate_epoch(
     val_dataloader: DataLoader,
     device: str,
     use_token_level_alignment: bool = False,
+    caption_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
 ) -> GroundingMetrics:
     """
     Run validation loop and compute all metrics.
@@ -900,6 +1004,7 @@ def validate_epoch(
         val_dataloader: Validation data loader
         device: Device string
         use_token_level_alignment: If True, use Phase-3 token-level encoding
+        caption_cache: Optional pre-encoded caption embeddings (sentence-level).
     
     Returns:
         GroundingMetrics for validation set
@@ -925,14 +1030,19 @@ def validate_epoch(
         if B == 0 or N == 0:
             continue
         
-        # Forward pass - encode captions
+        # Forward pass - encode captions (use pre-encoded when available)
         with torch.no_grad():
-            if use_token_level_alignment:
-                # Phase-3: Token-level embeddings
-                caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
-                query_embeddings = query_encoder.forward_batch(captions)
+            if caption_cache is not None:
+                query_embeddings = torch.stack(
+                    [caption_cache[c]['sentence'] for c in captions]
+                ).to(device)
             else:
                 query_embeddings = query_encoder.forward_batch(captions)
+
+            if use_token_level_alignment:
+                # Token-level still needs a live encoder call
+                caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
+                # sentence-level already obtained above
         
         # Forward pass - adapter
         with torch.no_grad():
@@ -1148,7 +1258,9 @@ def _run_training_loop(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
+        persistent_workers=True,
+        pin_memory=device.startswith('cuda'),
         collate_fn=collate_variable_humans,
         drop_last=True,
     )
@@ -1169,7 +1281,9 @@ def _run_training_loop(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
+        persistent_workers=True,
+        pin_memory=device.startswith('cuda'),
         collate_fn=collate_variable_humans,
         drop_last=False,
     )
@@ -1177,6 +1291,31 @@ def _run_training_loop(
     print(f"\n✓ DataLoaders ready")
     print(f"  Train samples: {len(train_dataset)}")
     print(f"  Val samples: {len(val_dataset)}")
+    
+    # =========================================================================
+    # PRELOAD CACHE FILES INTO RAM  (eliminates ALL disk I/O during training)
+    # Must happen BEFORE DataLoader workers fork (first iteration).
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("Preloading cache files into RAM")
+    print("-" * 50)
+    train_dataset.preload_to_ram()
+    val_dataset.preload_to_ram()
+    
+    # =========================================================================
+    # PRE-ENCODE CAPTIONS  (eliminates per-batch MiniLM sentence inference)
+    # =========================================================================
+    
+    print("\n" + "-" * 50)
+    print("Pre-encoding caption embeddings")
+    print("-" * 50)
+    caption_cache = precompute_caption_embeddings(
+        datasets=[train_dataset, val_dataset],
+        query_encoder=query_encoder,
+        device=device,
+        use_token_level=use_token_level_alignment,
+    )
     
     # =========================================================================
     # OPTIMIZER & SCHEDULER
@@ -1293,20 +1432,20 @@ def _run_training_loop(
             if B == 0 or N == 0:
                 continue
             
-            # Forward pass - encode captions
+            # Forward pass - encode captions (use pre-encoded sentence embs)
             with torch.no_grad():
+                # Sentence-level: lookup from pre-encoded cache
+                query_embeddings = torch.stack(
+                    [caption_cache[c]['sentence'] for c in captions]
+                ).to(device)                                       # [B, 256]
+
                 if use_token_level_alignment:
-                    # Phase-3: Token-level embeddings [B, T, 256] + mask [B, T]
+                    # Token-level: still needs live encoder call
                     caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
-                    # Also get sentence-level for scorer (still uses pooled query)
-                    query_embeddings = query_encoder.forward_batch(captions)
                     
                     # Phase-3 diagnostic: track actual caption token lengths
                     actual_lengths = caption_mask.sum(dim=1).tolist()  # [B]
                     epoch_caption_lengths.extend(actual_lengths)
-                else:
-                    # Phase-0/1: Sentence-level embedding [B, 256]
-                    query_embeddings = query_encoder.forward_batch(captions)
             
             # Forward pass - adapter
             if use_token_level_alignment:
@@ -1429,6 +1568,7 @@ def _run_training_loop(
             val_dataloader=val_dataloader,
             device=device,
             use_token_level_alignment=use_token_level_alignment,
+            caption_cache=caption_cache,
         )
         
         # Log validation metrics

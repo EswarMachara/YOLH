@@ -18,6 +18,9 @@ USAGE:
     python evaluation/grounding_eval.py --config config/config.yaml --checkpoint checkpoints/best_model.pt
 """
 
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Prevent fork warning with num_workers>0
+
 import sys
 from pathlib import Path
 
@@ -45,6 +48,7 @@ from training.grounding_train_v2 import (
     MIRLLoss,
     CachedFeatureDataset,
     collate_variable_humans,
+    precompute_caption_embeddings,
 )
 from adapter.cross_attention_adapter import CrossAttentionAdapter, create_grounding_adapter
 from adapter.text_visual_alignment_adapter import TextVisualAlignmentAdapter
@@ -92,6 +96,7 @@ def evaluate_test_split(
     test_dataloader: DataLoader,
     device: str,
     use_token_level_alignment: bool = False,
+    caption_cache: Optional[Dict] = None,
 ) -> GroundingMetrics:
     """
     Evaluate on TEST split and compute all metrics.
@@ -104,6 +109,7 @@ def evaluate_test_split(
         test_dataloader: Test data loader
         device: Device string
         use_token_level_alignment: If True, use Phase-3 token-level alignment
+        caption_cache: Optional pre-encoded caption embeddings (sentence-level).
     
     Returns:
         GroundingMetrics for test set
@@ -131,17 +137,19 @@ def evaluate_test_split(
         if B == 0 or N == 0:
             continue
         
-        # Forward pass - encode captions
-        if use_token_level_alignment:
-            # Phase-3: Token-level embeddings [B, T, 256] + mask [B, T]
-            caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
-            # Also get sentence-level for scorer
+        # Forward pass - encode captions (use pre-encoded when available)
+        if caption_cache is not None:
+            query_embeddings = torch.stack(
+                [caption_cache[c]['sentence'] for c in captions]
+            ).to(device)
+        else:
             query_embeddings = query_encoder.forward_batch(captions)
-            # Phase-3: Token-level cross-modal alignment
+
+        if use_token_level_alignment:
+            # Token-level still needs live encoder call
+            caption_tokens, caption_mask = query_encoder.forward_tokens_batch(captions)
             grounded_tokens = adapter(visual_embeddings, caption_tokens, caption_mask)
         else:
-            # Phase-0/1: Sentence-level embedding [B, 256]
-            query_embeddings = query_encoder.forward_batch(captions)
             grounded_tokens = adapter(visual_embeddings, query_embeddings)
         
         # Forward pass - scorer (always uses sentence-level query)
@@ -381,12 +389,25 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
         test_dataset,
         batch_size=eval_batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
+        persistent_workers=True,
+        pin_memory=device.startswith('cuda'),
         collate_fn=collate_variable_humans,
         drop_last=False,
     )
     
     print(f"✓ Test dataset loaded: {len(test_dataset)} samples")
+    
+    # Preload cache files into RAM (eliminates disk I/O during eval)
+    test_dataset.preload_to_ram()
+    
+    # Pre-encode captions for fast evaluation
+    caption_cache = precompute_caption_embeddings(
+        datasets=[test_dataset],
+        query_encoder=query_encoder,
+        device=device,
+        use_token_level=use_token_level_alignment,
+    )
     
     # Evaluate
     metrics = evaluate_test_split(
@@ -397,6 +418,7 @@ def evaluate(config: Config, checkpoint_path: Optional[Path] = None, batch_size:
         test_dataloader=test_dataloader,
         device=device,
         use_token_level_alignment=use_token_level_alignment,
+        caption_cache=caption_cache,
     )
     
     # Save results
