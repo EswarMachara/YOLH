@@ -35,6 +35,109 @@ from dataclasses import dataclass
 from tqdm import tqdm
 
 
+def load_annotation_splits_from_file(split_file: Path) -> Optional[Dict[str, Set[int]]]:
+    """
+    Load annotation-level splits from persistent split file.
+    
+    The split file format is:
+    {
+        "metadata": {...},
+        "splits": {
+            "train": ["image_id_ann_id_hash", ...],
+            "val": [...],
+            "test": [...]
+        }
+    }
+    
+    Sample IDs are composite strings: "image_id_ann_id_hash"
+    We extract the image_id (first part before '_') for YOLO image-level splits.
+    
+    Args:
+        split_file: Path to data_splits.json
+        
+    Returns:
+        Dict with 'train', 'val', 'test' keys containing IMAGE IDs (not annotation IDs),
+        or None if file doesn't exist or is invalid.
+    """
+    if not split_file.exists():
+        print(f"  [SPLIT] Split file not found: {split_file}")
+        return None
+    
+    try:
+        with open(split_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Extract image IDs from composite sample IDs
+        # Format: "image_id_ann_id_hash" -> extract image_id (first integer)
+        splits = {}
+        for split_name in ['train', 'val', 'test']:
+            sample_ids = data.get('splits', {}).get(split_name, [])
+            image_ids = set()
+            for sample_id in sample_ids:
+                # Sample ID format: "image_id_ann_id_hash"
+                # Extract first integer before first underscore
+                try:
+                    image_id = int(sample_id.split('_')[0])
+                    image_ids.add(image_id)
+                except (ValueError, IndexError):
+                    continue
+            splits[split_name] = image_ids
+        
+        metadata = data.get('metadata', {})
+        total_samples = sum(len(data.get('splits', {}).get(s, [])) for s in ['train', 'val', 'test'])
+        
+        print(f"  [SPLIT] Loaded persistent splits from: {split_file}")
+        print(f"           Samples: {total_samples:,} total")
+        print(f"           Images: Train={len(splits['train']):,} | Val={len(splits['val']):,} | Test={len(splits['test']):,}")
+        
+        return splits
+    
+    except Exception as e:
+        print(f"  [SPLIT] Failed to load split file: {e}")
+        return None
+
+
+def derive_image_splits_from_annotations(
+    image_splits: Dict[str, Set[int]],
+    annotations_by_image: Dict[int, List],
+) -> Tuple[Set[int], Set[int]]:
+    """
+    Filter image splits to only include images that have annotations.
+    
+    The split file provides image IDs (extracted from sample IDs).
+    Some images may have samples in MULTIPLE splits (e.g., some annotations 
+    in train, some in val). For YOLO training, we use conservative logic:
+    
+    - TRAIN: Image has ANY sample in train split (highest priority)
+    - VAL: Image has samples in val BUT NONE in train
+    - TEST images are excluded from YOLO fine-tuning
+    
+    Args:
+        image_splits: Dict with 'train', 'val', 'test' sets of image IDs
+        annotations_by_image: Dict mapping image_id -> list of annotations
+        
+    Returns:
+        (train_image_ids, val_image_ids)
+    """
+    available_images = set(annotations_by_image.keys())
+    
+    train_images_from_file = image_splits.get('train', set())
+    val_images_from_file = image_splits.get('val', set())
+    
+    # Train: images in train split AND have annotations
+    train_image_ids = train_images_from_file & available_images
+    
+    # Val: images in val split AND have annotations BUT NOT in train
+    # This handles the case where an image has samples in both train and val
+    val_image_ids = (val_images_from_file & available_images) - train_image_ids
+    
+    print(f"  [SPLIT] Derived image splits:")
+    print(f"           Train: {len(train_image_ids):,} images")
+    print(f"           Val: {len(val_image_ids):,} images (excluding images also in train)")
+    
+    return train_image_ids, val_image_ids
+
+
 @dataclass
 class YOLODatasetConfig:
     """Configuration for YOLO dataset building."""
@@ -160,6 +263,7 @@ class YOLODatasetBuilder:
         output_dir: Path,
         split_config: Dict,
         min_bbox_area_ratio: float = 0.01,
+        split_file: Optional[Path] = None,
     ):
         """
         Args:
@@ -168,12 +272,16 @@ class YOLODatasetBuilder:
             output_dir: Output directory for YOLO dataset
             split_config: Dict with 'train', 'val', 'test' ratios and 'seed'
             min_bbox_area_ratio: Minimum bbox area as fraction of image area
+            split_file: Path to persistent split file (data_splits.json).
+                        If provided, uses annotation splits from this file.
+                        If None, falls back to random split based on split_config.
         """
         self.coco_json_path = coco_json_path
         self.images_dir = images_dir
         self.output_dir = Path(output_dir)
         self.split_config = split_config
         self.min_bbox_area_ratio = min_bbox_area_ratio
+        self.split_file = Path(split_file) if split_file else None
         
         # Load COCO data
         print(f"Loading COCO annotations from: {coco_json_path}")
@@ -201,12 +309,28 @@ class YOLODatasetBuilder:
     
     def _compute_image_splits(self) -> Tuple[Set[int], Set[int]]:
         """
-        Compute image-level splits from sample-level logic.
+        Compute image-level splits.
+        
+        If split_file is provided, derives image splits from the persistent split file
+        to ensure consistency with grounding training.
+        Otherwise, falls back to random image-level split.
         
         Returns:
             (train_image_ids, val_image_ids)
         """
-        # Get all image IDs that have annotations
+        # Priority 1: Use persistent split file if provided
+        if self.split_file is not None:
+            image_splits = load_annotation_splits_from_file(self.split_file)
+            if image_splits is not None:
+                return derive_image_splits_from_annotations(
+                    image_splits, 
+                    self.annotations_by_image
+                )
+            else:
+                print("  [SPLIT] WARNING: Split file specified but couldn't be loaded. Falling back to random split.")
+        
+        # Fallback: Random image-level split (legacy behavior)
+        print("  [SPLIT] Using random image-level split (no split_file provided)")
         all_image_ids = list(self.annotations_by_image.keys())
         
         # Shuffle deterministically
@@ -532,6 +656,7 @@ def build_yolo_dataset(
     output_dir: Path,
     split_config: Dict,
     min_bbox_area_ratio: float = 0.01,
+    split_file: Optional[Path] = None,
 ) -> YOLODatasetBuilder:
     """
     Convenience function to build YOLO dataset.
@@ -542,6 +667,8 @@ def build_yolo_dataset(
         output_dir: Output directory for YOLO dataset
         split_config: Split configuration dict
         min_bbox_area_ratio: Minimum bbox area ratio filter
+        split_file: Path to persistent split file (data_splits.json).
+                    If provided, ensures YOLO uses same splits as grounding training.
         
     Returns:
         YOLODatasetBuilder instance with statistics
@@ -552,6 +679,7 @@ def build_yolo_dataset(
         output_dir=output_dir,
         split_config=split_config,
         min_bbox_area_ratio=min_bbox_area_ratio,
+        split_file=split_file,
     )
     builder.build()
     return builder

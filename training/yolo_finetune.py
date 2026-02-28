@@ -206,7 +206,7 @@ def train_pose_model(
         plots=True,
         save=True,
         save_period=5,  # Save every 5 epochs
-        patience=10,  # Early stopping patience
+        patience=8,  # Early stopping patience
         workers=4,
         seed=config.runtime.seed,
     )
@@ -434,11 +434,18 @@ def main(config_override: Optional[Config] = None):
             'seed': config.splits.seed,
         }
         
+        # Use persistent split file if available (ensures consistency with grounding training)
+        split_file = None
+        if hasattr(config.splits, 'split_file') and config.splits.split_file:
+            split_file = Path(config.splits.split_file)
+            print(f"  Using persistent split file: {split_file}")
+        
         builder = build_yolo_dataset(
             coco_json_path=config.annotations_path,
             images_dir=config.images_dir,
             output_dir=dataset_dir,
             split_config=split_config,
+            split_file=split_file,
         )
     else:
         print("\n[SKIPPING DATASET BUILD]")
